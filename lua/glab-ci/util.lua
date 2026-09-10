@@ -80,7 +80,10 @@ end
 -- process could run (e.g. `vim.system` threw ENOENT because glab is
 -- missing) — in that case `stderr` carries the error text.
 function M.notify_failed(label, code, stderr)
-  local detail = M.truncate(stderr, 200)
+  local detail = (stderr or ''):gsub('%s+$', '')
+  if detail == '' then
+    detail = '(no error output)'
+  end
   local msg = code and string.format('glab %s failed (exit %d): %s', label, code, detail) or string.format('glab %s failed: %s', label, detail)
   vim.notify(msg, vim.log.levels.ERROR, { title = 'glab' })
 end

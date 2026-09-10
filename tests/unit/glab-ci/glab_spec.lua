@@ -50,4 +50,30 @@ return {
       h.truthy(notification:match 'glab ci get failed')
     end,
   },
+  {
+    name = 'failure notify keeps the full stderr (no 200-char truncation)',
+    run = function()
+      -- glab/GitLab errors put the actionable part after a long URL, so the
+      -- tail must survive into the notification (:messages shows it all).
+      local tail = '": dial tcp: lookup gitlab.example.com: i/o timeout'
+      local long_stderr = 'Get "https://gitlab.example.com/api/v4/projects/' .. string.rep('a', 300) .. tail
+      local notification
+      h.with_notify(function(message)
+        notification = message
+      end, function()
+        h.with_system(function(_, _, callback)
+          callback { code = 1, stdout = '', stderr = long_stderr }
+          return {}
+        end, function()
+          glab.ci_list(function() end)
+          h.wait_until(function()
+            return notification ~= nil
+          end)
+        end)
+      end)
+
+      h.truthy(notification:find(long_stderr, 1, true), 'notification should contain the full stderr')
+      h.truthy(notification:sub(-#tail) == tail, 'notification should end with the stderr tail')
+    end,
+  },
 }
