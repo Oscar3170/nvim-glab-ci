@@ -77,6 +77,25 @@ M.ANSI_HL = {
 
 local setup_done = false
 
+local function apply_log_winbar_highlights()
+  -- Use the active colorscheme's WinBar (or StatusLine) background so the
+  -- decoration remains distinct without imposing a hard-coded terminal color.
+  local base = vim.api.nvim_get_hl(0, { name = 'WinBar', link = false })
+  if not base.bg then
+    base = vim.api.nvim_get_hl(0, { name = 'StatusLine', link = false })
+  end
+  local bg = base.bg
+  vim.api.nvim_set_hl(0, 'GlabLogWinbar', { bg = bg, fg = base.fg })
+  vim.api.nvim_set_hl(0, 'GlabLogWinbarDim', { bg = bg, fg = vim.api.nvim_get_hl(0, { name = 'Comment', link = false }).fg })
+  vim.api.nvim_set_hl(0, 'GlabLogWinbarAccent', { bg = bg, fg = vim.api.nvim_get_hl(0, { name = 'Identifier', link = false }).fg })
+  vim.api.nvim_set_hl(0, 'GlabLogWinbarTitle', { bg = bg, fg = base.fg, bold = true })
+  for status, spec in pairs(M.STATUSES) do
+    local name = 'GlabLogWinbar' .. status:sub(1, 1):upper() .. status:sub(2)
+    vim.api.nvim_set_hl(0, name, { bg = bg, fg = spec.fg })
+  end
+  vim.api.nvim_set_hl(0, 'GlabLogWinbarRunning', { bg = bg, fg = M.STATUSES.running.fg })
+end
+
 -- ANSI colors per base / bright flavor. Each is a foreground hex; we use
 -- the user's `Normal` fg as the implicit default (so "no SGR" lines
 -- inherit the buffer's text color rather than forcing a specific one).
@@ -128,6 +147,7 @@ function M.setup()
   vim.api.nvim_set_hl(0, 'GlabLogControl', { fg = '#9e9e9e' }) -- light grey
   vim.api.nvim_set_hl(0, 'GlabLogSection', { fg = '#0ea5a4' }) -- teal
   vim.api.nvim_set_hl(0, 'GlabLogCmd', { fg = '#4e9a06' }) -- green
+  apply_log_winbar_highlights()
   vim.api.nvim_create_autocmd('ColorScheme', {
     callback = function()
       for _, s in pairs(M.STATUSES) do
@@ -147,6 +167,7 @@ function M.setup()
       vim.api.nvim_set_hl(0, 'GlabLogControl', { fg = '#9e9e9e' })
       vim.api.nvim_set_hl(0, 'GlabLogSection', { fg = '#0ea5a4' })
       vim.api.nvim_set_hl(0, 'GlabLogCmd', { fg = '#4e9a06' })
+      apply_log_winbar_highlights()
     end,
   })
   setup_done = true

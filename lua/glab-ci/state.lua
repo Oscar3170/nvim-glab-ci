@@ -89,6 +89,11 @@ M.log_status = nil
 M.log_follow = false
 M.log_job = nil
 M.ansi_state = nil
+-- Per-layout log-view state. The panel's prior local winbar is restored
+-- exactly when leaving the log, and expanded is reset on full teardown.
+M.log_header_expanded = false
+M.log_previous_winbar = nil
+M.log_winbar_saved = false
 
 -- Log display preferences. Like `branch`, these survive layout teardown
 -- (they are user preferences, not per-run state), so a fresh `:GlabCI`
@@ -130,6 +135,9 @@ function M.reset_layout()
   M.log_follow = false
   M.log_job = nil
   M.ansi_state = nil
+  M.log_header_expanded = false
+  M.log_previous_winbar = nil
+  M.log_winbar_saved = false
   M.job_action = {}
 end
 

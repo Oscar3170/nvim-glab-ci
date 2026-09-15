@@ -346,7 +346,7 @@ local function setup_keymaps(buf)
   --
   -- Pass the full job object (not just id/name/status/pipeline_id)
   -- so the log header can display stage, started_at, finished_at,
-  -- duration, etc. — see `log_view.header_lines`.
+  -- duration, etc. — see `glab-ci.log_header`.
   --
   -- The second argument is a refresh callback: `log.lua` uses it to
   -- (a) restart the pipeline timer + refresh when the user goes back

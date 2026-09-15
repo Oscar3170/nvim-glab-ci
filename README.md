@@ -39,7 +39,7 @@ vim.pack.add({
 - `:GlabCI` — open or focus the pipeline list
 - Pipeline list: `<CR>` opens a pipeline; `r` refreshes; `f` filters by branch; `c` clears the filter; `q` closes
 - Pipeline jobs: `<CR>` opens a log; `r` refreshes; `R` retries; `T` triggers manual jobs; `C` cancels running/pending jobs; `q` / `<Esc>` returns to the list
-- Job logs: `f` toggles follow mode; `r` re-fetches; `t`, `d`, `o`, `T`, and `i` control timestamp and stream-prefix display; `q` / `<Esc>` returns to the jobs
+- Job logs: a sticky one-row winbar shows job status and identity while the trace scrolls. `H` toggles compact/detailed, width-aware header content that always remains one row; `f` toggles follow mode; `r` re-fetches; `t`, `d`, `o`, `T`, and `i` control timestamp and stream-prefix display; `q` / `<Esc>` returns to the jobs
 
 ## Development
 

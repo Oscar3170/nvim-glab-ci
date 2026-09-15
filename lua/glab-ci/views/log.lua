@@ -63,6 +63,7 @@ local glab = require 'glab-ci.glab'
 local ansi = require 'glab-ci.ansi'
 local util = require 'glab-ci.util'
 local logfmt = require 'glab-ci.logfmt'
+local log_header = require 'glab-ci.log_header'
 
 local ns = vim.api.nvim_create_namespace 'glab_ci_log'
 
@@ -71,8 +72,8 @@ local ns = vim.api.nvim_create_namespace 'glab_ci_log'
 -- `i`). Each entry is `{ ts, stream, typ, border, content, marks }` where
 -- `marks` are ANSI extmark byte-ranges *relative to the content* (the record
 -- keeps the prefix factored out so re-rendering can rebuild the prefix at
--- the new width). The header lines are not stored here — they're rebuilt on
--- demand.
+-- the new width). The winbar is independent window decoration and is not
+-- stored here.
 local log_lines = {}
 
 -- Fold bookkeeping for the `00` job-control sections, based on the hidden
@@ -86,11 +87,6 @@ local log_lines = {}
 local folds = {}
 local open_sections = {}
 local fold_names = {}
-
--- Number of leading header lines in the log buffer. The header is always
--- the 3 context lines + divider, so the first content record renders at
--- 1-indexed buffer line `HEADER_LINES + rec_idx`.
-local HEADER_LINES = 4
 
 -- Pipeline refresh callback, passed in from views/pipeline.lua's `<CR>`
 -- keymap (`open(job, refresh_cb)`). Used to (a) restart the
@@ -120,6 +116,10 @@ local placeholder_present = false
 -- because the assignment runs before `ensure_buf` is ever called.
 local start_trace
 
+-- `WinResized`/`VimResized` are not buffer-scoped events. Register their
+-- harmless, state-guarded callbacks once rather than once per log buffer.
+local resize_autocmds = {}
+
 -- Resolve the *current* timestamp/stream display config from the user's
 -- orthogonal `state.log_ts` preferences.
 local PREC_CYCLE = { 'us', 'ms', 's' }
@@ -130,81 +130,6 @@ local function current_cfg()
     prec = state.log_ts.prec,
     local_tz = state.log_ts.local_tz,
     show_stream = state.log_ts.show_stream,
-  }
-end
-
--- Short tag for the current timestamp config, shown in the header so the
--- user can see at a glance what `t` / `d` / `o` / `T` currently select.
-local function ts_label()
-  local ts = state.log_ts
-  if not ts.show_ts then
-    return 'off'
-  end
-  return ts.prec .. (ts.show_date and '' or '-t') .. (ts.local_tz and '' or '|utc')
-end
-
--- Format an ISO 8601 timestamp as `YYYY-MM-DD HH:MM:SS` in *local* time.
--- The local components alone are usually enough to identify when
--- something ran. Returns the input unchanged if it doesn't match the
--- expected shape so a malformed timestamp still appears in the header.
-local function friendly_time(iso)
-  -- Defensive: never index a non-string (e.g. vim.NIL from JSON null
-  -- would crash `iso:match` with E5108). The decode boundary in
-  -- `glab.ci_get`/`ci_list` already normalizes vim.NIL to nil, but
-  -- callers may pass values from other sources.
-  if type(iso) ~= 'string' then
-    return nil
-  end
-  local t = util.parse_iso(iso)
-  if not t then
-    return iso
-  end
-  return string.format('%04d-%02d-%02d %02d:%02d:%02d', t.year, t.month, t.day, t.hour, t.min, t.sec)
-end
-
--- Header lines for the log buffer. Three rows + a divider:
---   1. ● <name> @ <stage>   job#<id>   pipeline#<iid> (ref <ref>, commit <sha8>)
---   2. status: <status>  •  duration: <duration>  •  follow:<on|off>
---   3. started: <iso>  •  finished: <iso>  (omitted when unknown)
---
--- The divider matches the pipeline view's style. `job.follow_on` reflects
--- `state.log_follow` so the user can see at a glance whether tail-f
--- is active. All callers build `job` via `job_context(follow_on)`, which
--- carries the flag as a field — there is no separate second argument
--- (it used to read a `follow_on` parameter that was never passed, so the
--- header always showed `follow:off`).
-local function header_lines(job)
-  -- Coerce header fields at the boundary: the job object originates from
-  -- the decoded `jobs` array, and a wrongly-shaped value (table/boolean)
-  -- would make `string.format` raise (review 6).
-  local name = type(job.name) == 'string' and job.name ~= '' and job.name or ('job ' .. tostring(job.id or '?'))
-  local stage = type(job.stage) == 'string' and job.stage or '?'
-  local id = tostring(job.id or '?')
-  local ref = type(job.pipeline_ref) == 'string' and job.pipeline_ref or '?'
-  local iid = tostring(job.pipeline_iid or job.pipeline_id or '?')
-  local sha = type(job.pipeline_sha) == 'string' and job.pipeline_sha or '?'
-  local status = type(job.status) == 'string' and job.status or '?'
-  local follow = job.follow_on and 'on' or 'off'
-
-  local duration_str
-  if type(job.duration) == 'number' and job.duration > 0 then
-    duration_str = util.fmt_duration(job.duration, status, job.started_at)
-  elseif job.started_at and not job.finished_at then
-    duration_str = 'running'
-  else
-    duration_str = '—'
-  end
-  local started_str = job.started_at and friendly_time(job.started_at) or '—'
-  local finished_str = job.finished_at and friendly_time(job.finished_at) or '—'
-
-  local line1 = string.format('● %s @ %s   job#%s   pipeline#%s (ref %s, commit %s)', name, stage, id, iid, ref, sha)
-  local line2 = string.format('  status: %s  •  duration: %s  •  follow:%s  •  ts:%s', status, duration_str, follow, ts_label())
-  local line3 = string.format('  started: %s  •  finished: %s', started_str, finished_str)
-  return {
-    line1,
-    line2,
-    line3,
-    util.DIVIDER,
   }
 end
 
@@ -219,19 +144,7 @@ local function reset_buf(buf, lines)
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 end
 
--- Replace just the header lines (the first `n` lines) with `new_lines`,
--- leaving log content untouched. Used to update the `follow:on/off` token
--- when the user toggles follow or when the stream exits.
-local function replace_header(buf, new_lines)
-  if #new_lines == 0 then
-    return
-  end
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, #new_lines, false, new_lines)
-  vim.bo[buf].modifiable = false
-end
-
--- Build the job-context object the header line wants. Pulled together
+-- Build the job-context object the winbar renderer wants. Pulled together
 -- here so callers don't have to memorize which fields live on `state.*`
 -- vs which come from the `<CR>` argument.
 local function job_context(follow_on)
@@ -249,6 +162,34 @@ local function job_context(follow_on)
     pipeline_sha = state._pipeline_sha,
     follow_on = follow_on,
   }
+end
+
+-- The winbar belongs to the shared panel window, not the log buffer. Keep
+-- its former local value so list/pipeline views are completely unaffected.
+function M.render_winbar()
+  local win = state.list_win
+  if not win or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= state.log_buf then
+    return
+  end
+  local rendered = log_header.render(job_context(state.log_follow), vim.api.nvim_win_get_width(win), state.log_header_expanded, state.log_ts)
+  vim.wo[win].winbar = rendered.format
+end
+
+function M.restore_winbar()
+  local win = state.list_win
+  if state.log_winbar_saved and win and vim.api.nvim_win_is_valid(win) then
+    vim.wo[win].winbar = state.log_previous_winbar or ''
+  end
+  state.log_previous_winbar = nil
+  state.log_winbar_saved = false
+end
+
+local function install_winbar(win)
+  if not state.log_winbar_saved then
+    state.log_previous_winbar = vim.wo[win].winbar
+    state.log_winbar_saved = true
+  end
+  M.render_winbar()
 end
 
 -- Render one structured log record into (prefix + content) text plus the
@@ -404,9 +345,10 @@ local function record_chunk(parsed)
   return out_lines, out_marks, new_folds
 end
 
--- Map a record index to its 1-indexed buffer line (after the fixed header).
+-- Record indexes and buffer lines are now identical: the winbar is window
+-- decoration, never a buffer-line offset.
 local function content_line(rec_idx)
-  return HEADER_LINES + rec_idx
+  return rec_idx
 end
 
 -- Create manual folds for `list` (records `{ start_rec, end_rec, name }`)
@@ -453,23 +395,21 @@ function M.foldtext()
   return '▸ ' .. (info.name or 'section') .. '  (' .. n .. ' lines)'
 end
 
--- The transient "Getting job trace…" line sits alone right after the
--- fixed header (buffer line `HEADER_LINES + 1`), so removing it touches
--- neither the header nor any content records / folds.
+-- The loading placeholder is the first and only buffer line until trace
+-- content arrives.
 local function remove_placeholder(buf)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
-  local idx = HEADER_LINES -- 0-based index of the first content line
-  if vim.api.nvim_buf_line_count(buf) > idx then
+  if vim.api.nvim_buf_line_count(buf) > 0 then
     vim.bo[buf].modifiable = true
-    vim.api.nvim_buf_set_lines(buf, idx, idx + 1, false, {})
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, {})
     vim.bo[buf].modifiable = false
   end
 end
 
--- Rebuild the whole log buffer (header + every stored content line) from
--- `log_lines` using the current display preferences. Called when the user
+-- Rebuild the trace-only log buffer from `log_lines` using the current
+-- display preferences. Called when the user
 -- toggles `t` / `T` / `i`. Follow mode is untouched; the cursor is left to
 -- Neovim's clamping on a buffer rewrite.
 local function rerender()
@@ -478,13 +418,9 @@ local function rerender()
     return
   end
   local cfg = current_cfg()
-  local lines = header_lines(job_context(state.log_follow))
+  local lines = {}
   local marks = {}
-  -- `lines` currently holds just the header (e.g. 4 lines at buffer lines
-  -- 0..3), so the first content line sits right after it. `#lines` is thus
-  -- the 0-based index of the first content record (NOT `#lines - 1`, which
-  -- would point at the last header line / divider).
-  local content_start = #lines
+  local content_start = 0
   for i, rec in ipairs(log_lines) do
     local text, lmarks = render_record(rec, cfg)
     lines[#lines + 1] = text
@@ -493,18 +429,13 @@ local function rerender()
       marks[#marks + 1] = { lnum0 = abs, col_start = m.s, col_end = m.e, hl = m.hl }
     end
   end
+  if placeholder_present and #lines == 0 then
+    lines = { 'Getting job trace...' }
+  end
   reset_buf(buf, lines)
   -- The full rewrite discards manual folds; re-create them from `folds`.
   fold_names[buf] = nil
   apply_folds(buf, folds)
-  -- Restore the transient "Getting job trace…" placeholder if it's still
-  -- showing (i.e. no content has streamed yet).
-  if placeholder_present then
-    vim.bo[buf].modifiable = true
-    local n = vim.api.nvim_buf_line_count(buf)
-    vim.api.nvim_buf_set_lines(buf, n, n, false, { 'Getting job trace...' })
-    vim.bo[buf].modifiable = false
-  end
   for _, m in ipairs(marks) do
     vim.api.nvim_buf_set_extmark(buf, ns, m.lnum0, m.col_start, {
       end_col = m.col_end,
@@ -512,6 +443,7 @@ local function rerender()
       priority = 100,
     })
   end
+  M.render_winbar()
 end
 
 -- Append ANSI-parsed lines + extmarks to the log buffer. `lines` come in
@@ -523,8 +455,17 @@ local function append_lines(buf, lines, marks)
     return
   end
   local current_count = vim.api.nvim_buf_line_count(buf)
+  -- Deleting Neovim's sole placeholder line leaves one unavoidable empty
+  -- buffer line. Replace that sentinel on the first append so record 1 is
+  -- truly buffer line 1, rather than appending after an empty line.
+  local replace_empty_first = current_count == 1 and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == '' and #log_lines == #lines
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, current_count, current_count, false, lines)
+  if replace_empty_first then
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, lines)
+    current_count = 0
+  else
+    vim.api.nvim_buf_set_lines(buf, current_count, current_count, false, lines)
+  end
   vim.bo[buf].modifiable = false
   for _, m in ipairs(marks) do
     -- `m.lnum0` is the relative offset within `lines`; absolute is
@@ -575,8 +516,19 @@ local function ensure_buf()
     group = state.augroup,
     callback = function()
       state.kill_log_stream()
+      M.restore_winbar()
     end,
   })
+  if #resize_autocmds == 0 then
+    for _, event in ipairs { 'WinResized', 'VimResized' } do
+      resize_autocmds[#resize_autocmds + 1] = vim.api.nvim_create_autocmd(event, {
+        group = state.augroup,
+        callback = function()
+          M.render_winbar()
+        end,
+      })
+    end
+  end
 
   -- Native `/`, `y`, `G`, `gg` all work without explicit keymaps: the
   -- buffer is non-modifiable so it behaves like a read-only file for
@@ -586,9 +538,7 @@ local function ensure_buf()
   -- `f` toggles follow mode (PLAN §7.3 / §12).
   vim.keymap.set('n', 'f', function()
     state.log_follow = not state.log_follow
-    if state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf) then
-      replace_header(state.log_buf, header_lines(job_context(state.log_follow)))
-    end
+    M.render_winbar()
     -- When newly enabling follow, snap to bottom so the user immediately
     -- sees the latest content.
     if state.log_follow and state.list_win and vim.api.nvim_win_is_valid(state.list_win) and state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf) then
@@ -598,7 +548,7 @@ local function ensure_buf()
   end, { buffer = buf, desc = 'Toggle follow mode' })
 
   -- Display toggles. All re-render from the stored `log_lines` records and
-  -- refresh the header (which shows the current config). `t` cycles the
+  -- refresh the winbar (which shows the current config). `t` cycles the
   -- timestamp time precision (µs→ms→s), `d` hides/shows the date (showing
   -- only the time), `o` hides/shows the whole timestamp, `T` flips between
   -- system tz and UTC, and `i` hides/shows the stream indicator.
@@ -629,6 +579,10 @@ local function ensure_buf()
     state.log_ts.show_stream = not state.log_ts.show_stream
     rerender()
   end, { buffer = buf, desc = 'Toggle stream indicator' })
+  vim.keymap.set('n', 'H', function()
+    state.log_header_expanded = not state.log_header_expanded
+    M.render_winbar()
+  end, { buffer = buf, desc = 'Toggle detailed log header' })
 
   -- `r` re-fetches: kill any in-flight stream, reset, restart. Current
   -- follow setting is preserved (the user can flip it with `f` if they
@@ -655,6 +609,7 @@ local function ensure_buf()
     M._generation = M._generation + 1
 
     if state.pipeline_buf and vim.api.nvim_buf_is_valid(state.pipeline_buf) and state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+      M.restore_winbar()
       vim.api.nvim_win_set_buf(state.list_win, state.pipeline_buf)
       -- The pipeline timer was stopped when the log opened (§8); restart.
       local refresh = pipeline_refresh
@@ -697,15 +652,10 @@ start_trace = function()
   local gen = M._generation
 
   if state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf) then
-    reset_buf(state.log_buf, header_lines(job_context(state.log_follow)))
-    -- Pre-seed a transient "Getting job trace…" placeholder so the user
-    -- sees loading feedback until the first real log line arrives. It's
-    -- removed as soon as the first content streams in (or on exit if the
-    -- job produced no output).
-    vim.bo[state.log_buf].modifiable = true
-    vim.api.nvim_buf_set_lines(state.log_buf, vim.api.nvim_buf_line_count(state.log_buf), -1, false, { 'Getting job trace...' })
-    vim.bo[state.log_buf].modifiable = false
+    -- The trace buffer contains no header rows: loading feedback is line 1.
+    reset_buf(state.log_buf, { 'Getting job trace...' })
     placeholder_present = true
+    M.render_winbar()
   end
 
   state.log_job = glab.ci_trace(
@@ -785,7 +735,7 @@ start_trace = function()
           remove_placeholder(state.log_buf)
           placeholder_present = false
         end
-        replace_header(state.log_buf, header_lines(job_context(false)))
+        M.render_winbar()
       end
       -- Clean exit (job finished — code 0 and we didn't kill it; the
       -- generation check above already filters killed streams).
@@ -795,7 +745,7 @@ start_trace = function()
         if pipeline_refresh then
           pipeline_refresh()
         end
-        -- Re-check the job itself so the log header status is not stuck
+        -- Re-check the job itself so the log winbar status is not stuck
         -- on the start-of-stream value (review 4.4): a job that finished
         -- while we watched kept showing `status: running` and no
         -- started/finished timestamps until now.
@@ -821,7 +771,7 @@ start_trace = function()
               state._job_duration = job.duration
               state._job_started_at = job.started_at
               state._job_finished_at = job.finished_at
-              replace_header(state.log_buf, header_lines(job_context(state.log_follow)))
+              M.render_winbar()
             end
           end)
         end
@@ -839,7 +789,7 @@ end
 --                     pipeline_sha? }
 --   refresh_cb   -- pipeline-view refresh callback (see module header).
 -- All fields except `id` are optional; they're used only to populate
--- the header. The trace itself keys on `id`.
+-- the winbar. The trace itself keys on `id`.
 function M.open(job, refresh_cb)
   if not job or not job.id then
     return
@@ -869,10 +819,14 @@ function M.open(job, refresh_cb)
     state.stop_timer(state.pipeline_buf)
   end
 
-  -- Swap the log buffer into the layout window if it's not already
-  -- there.
-  if state.list_win and vim.api.nvim_win_is_valid(state.list_win) and vim.api.nvim_win_get_buf(state.list_win) ~= buf then
-    vim.api.nvim_win_set_buf(state.list_win, buf)
+  -- Save the panel's local winbar before this shared window starts showing
+  -- the log, then render the sticky decoration after the buffer handoff.
+  if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+    install_winbar(state.list_win)
+    if vim.api.nvim_win_get_buf(state.list_win) ~= buf then
+      vim.api.nvim_win_set_buf(state.list_win, buf)
+    end
+    M.render_winbar()
   end
 
   start_trace()
@@ -884,6 +838,7 @@ end
 function M.shutdown()
   state.kill_log_stream()
   M._generation = M._generation + 1 -- invalidate any pending callbacks
+  M.restore_winbar()
   folds = {}
   open_sections = {}
   fold_names = {}
