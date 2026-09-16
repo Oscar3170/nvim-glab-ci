@@ -52,7 +52,7 @@ function M.trigger(job_id, cb)
   run({ 'ci', 'trigger', tostring(job_id) }, 'ci trigger', cb)
 end
 
--- Cancel a running/pending job: `glab ci cancel job <job-id>`.
+-- Cancel a running, pending, or created job: `glab ci cancel job <job-id>`.
 function M.cancel(job_id, cb)
   run({ 'ci', 'cancel', 'job', tostring(job_id) }, 'ci cancel job', cb)
 end

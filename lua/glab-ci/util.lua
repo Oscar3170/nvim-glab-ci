@@ -32,15 +32,52 @@ function M.parse_iso(iso)
   }
 end
 
--- Elapsed seconds since an ISO 8601 timestamp (0 when unknown).
-function M.elapsed_since(iso)
+-- Convert an ISO 8601 timestamp to an absolute Unix timestamp. GitLab
+-- includes a numeric timezone offset (or `Z`) in its API timestamps; honor
+-- it rather than interpreting the displayed clock time in Neovim's local
+-- timezone. Timestamps without a timezone retain the previous local-time
+-- behavior.
+function M.iso_epoch(iso)
   local t = M.parse_iso(iso)
   if not t then
+    return nil
+  end
+
+  local offset = nil
+  if iso:match '[zZ]$' then
+    offset = 0
+  else
+    local sign, hours, minutes = iso:match '([+-])(%d%d):?(%d%d)$'
+    if sign then
+      offset = (tonumber(hours) * 60 + tonumber(minutes)) * 60
+      if sign == '-' then
+        offset = -offset
+      end
+    end
+  end
+  if offset == nil then
+    return os.time(t)
+  end
+
+  -- Days since 1970-01-01, using a Gregorian calendar calculation that is
+  -- independent of the machine's timezone and daylight-saving rules.
+  local year = t.year - (t.month <= 2 and 1 or 0)
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local month = t.month + (t.month > 2 and -3 or 9)
+  local doy = math.floor((153 * month + 2) / 5) + t.day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  local days = era * 146097 + doe - 719468
+  return days * 86400 + t.hour * 3600 + t.min * 60 + t.sec - offset
+end
+
+-- Elapsed seconds since an ISO 8601 timestamp (0 when unknown).
+function M.elapsed_since(iso)
+  local then_epoch = M.iso_epoch(iso)
+  if not then_epoch then
     return 0
   end
-  local then_epoch = os.time(t)
-  local now_epoch = os.time(os.date '!*t')
-  return math.max(0, os.difftime(now_epoch, then_epoch))
+  return math.max(0, os.difftime(os.time(), then_epoch))
 end
 
 -- Format a job duration as `5m12s` / `42s` / `—`. Prefers `duration`

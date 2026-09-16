@@ -352,7 +352,7 @@ local function setup_keymaps(buf)
     M.refresh(buf, true)
   end, 'Refresh pipeline')
 
-  -- `<CR>` on a job opens its log in the same window via log_view.
+  -- `<CR>` on a job that has started opens its log in the same window via log_view.
   -- The pipeline view's 5 s timer is paused while the log is open
   -- (PLAN §8); the timer resumes when the user comes back.
   --
@@ -370,6 +370,10 @@ local function setup_keymaps(buf)
     local job = job_under_cursor()
     if not job then
       vim.notify('No job under cursor', vim.log.levels.WARN, { title = 'glab' })
+      return
+    end
+    if not job.started_at then
+      vim.notify('Cannot open log: job has not run', vim.log.levels.WARN, { title = 'glab' })
       return
     end
     log_view.open({
@@ -433,15 +437,15 @@ local function setup_keymaps(buf)
     end)
   end, 'Trigger manual job')
 
-  -- C cancels a running/pending job under the cursor. Notify otherwise.
+  -- C cancels a running/pending/created job under the cursor. Notify otherwise.
   map('C', function()
     local job = job_under_cursor()
     if not job then
       vim.notify('No job under cursor', vim.log.levels.WARN, { title = 'glab' })
       return
     end
-    if job.status ~= 'running' and job.status ~= 'pending' then
-      vim.notify(string.format('Cannot cancel: job status is "%s" (only running/pending)', job.status), vim.log.levels.WARN, { title = 'glab' })
+    if job.status ~= 'running' and job.status ~= 'pending' and job.status ~= 'created' then
+      vim.notify(string.format('Cannot cancel: job status is "%s" (only running/pending/created)', job.status), vim.log.levels.WARN, { title = 'glab' })
       return
     end
     set_job_feedback(buf, job.id, '⟳ cancelling…', 'GlabPending')
@@ -453,7 +457,7 @@ local function setup_keymaps(buf)
       set_job_feedback(buf, job.id, ok and '✓ canceled' or '✗ cancel failed', ok and 'GlabSuccess' or 'GlabFailed', 3000)
       M.refresh(buf)
     end)
-  end, 'Cancel running/pending job')
+  end, 'Cancel running/pending/created job')
 
   map('<Esc>', function()
     M.back_to_list()

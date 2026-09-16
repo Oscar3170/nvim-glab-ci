@@ -22,15 +22,13 @@ local pipeline_view = require 'glab-ci.views.pipeline'
 local ns = vim.api.nvim_create_namespace 'glab_ci_list'
 
 -- Format a relative-time string like glab's "(about 1 day ago)" from an ISO 8601
--- timestamp. Both times are interpreted as local so the *difference* is
--- correct regardless of timezone offsets in the input.
+-- timestamp. `util.iso_epoch` accounts for the timestamp's timezone offset.
 local function rel_time(iso)
-  local t = util.parse_iso(iso)
-  if not t then
+  local then_epoch = util.iso_epoch(iso)
+  if not then_epoch then
     return ''
   end
-  local then_epoch = os.time(t)
-  local now_epoch = os.time(os.date '!*t')
+  local now_epoch = os.time()
   local diff = os.difftime(now_epoch, then_epoch)
   if diff < 0 then
     return 'in the future'
