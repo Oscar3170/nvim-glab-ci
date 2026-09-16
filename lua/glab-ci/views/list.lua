@@ -54,8 +54,8 @@ end
 -- `pipelines` is an array of `{ id, iid, status, ref, created_at }`. When
 -- the active branch filter (`state.branch`) has no matches, render a
 -- friendlier placeholder than the bare "(no pipelines)".
-local function render(buf, pipelines)
-  local ref_str = state.branch and state.branch or 'all'
+local function render(buf, pipelines, branch)
+  local ref_str = branch or 'all'
   local lines = {
     string.format(' glab ci list • ref: %s • 5s refresh • r: refresh • f: filter • c: clear • <CR>: open • q: close', ref_str),
     '',
@@ -64,8 +64,8 @@ local function render(buf, pipelines)
   local marks = {} -- { lnum0, col_start, col_end, hl }
 
   if #pipelines == 0 then
-    if state.branch then
-      table.insert(lines, string.format(' (no pipelines for ref %s)', state.branch))
+    if branch then
+      table.insert(lines, string.format(' (no pipelines for ref %s)', branch))
     else
       table.insert(lines, ' (no pipelines)')
     end
@@ -140,6 +140,10 @@ end
 -- timer and the filter/clear keymaps call it without `manual` so they
 -- don't spam the user.
 local function refresh(buf, manual)
+  state.activate_for_buf(buf)
+  local layout = state.context_for_buf(buf)
+  local shared = state.shared_view_for_buf('list', buf)
+  local branch = shared and shared.branch or state.branch
   if state.inflight[buf] then
     return
   end
@@ -148,6 +152,9 @@ local function refresh(buf, manual)
   end
   state.inflight[buf] = true
   glab.ci_list(function(pipelines)
+    if layout and not state.activate(layout) then
+      return
+    end
     state.inflight[buf] = nil
     -- Dismiss the "Refreshing pipeline list…" notify once the fetch returns.
     if manual then
@@ -157,15 +164,16 @@ local function refresh(buf, manual)
       return
     end
     if vim.api.nvim_buf_is_valid(buf) then
-      render(buf, pipelines)
+      render(buf, pipelines, branch)
     end
-  end, state.branch)
+  end, branch)
 end
 
 -- Open the list buffer in the given window and wire up all its
 -- buffer-local behavior. The list buffer is created fresh per layout
 -- bootstrap — `state.list_buf` carries the handle afterwards.
 function M.open(buf, win)
+  state.activate_for_buf(buf)
   vim.api.nvim_buf_set_name(buf, 'glab://ci-list')
   vim.bo[buf].buftype = 'nofile'
   vim.bo[buf].swapfile = false
@@ -181,7 +189,7 @@ function M.open(buf, win)
   state.list_buf = buf
   state.list_win = win
 
-  render(buf, {})
+  render(buf, {}, state.shared_view_for_buf('list', buf) and state.shared_view_for_buf('list', buf).branch or state.branch)
   refresh(buf)
   state.start_timer(buf, 5000, function()
     refresh(buf)
@@ -198,48 +206,70 @@ function M.open(buf, win)
     end,
   })
 
+  local function map(lhs, callback, desc)
+    vim.keymap.set('n', lhs, function()
+      state.activate_for_current_win()
+      callback()
+    end, { buffer = buf, desc = desc })
+  end
+
   -- <CR> opens the pipeline under the cursor in the same window,
   -- replacing the list (single-pane drill-down).
-  vim.keymap.set('n', '<CR>', function()
+  map('<CR>', function()
     local lnum = vim.api.nvim_win_get_cursor(0)[1]
     local id = state.ids[buf] and state.ids[buf][lnum]
     if id then
       pipeline_view.open(id)
     end
-  end, { buffer = buf, desc = 'Open pipeline (drill-down)' })
+  end, 'Open pipeline (drill-down)')
 
   -- r triggers an immediate refresh (in addition to the 5s timer).
-  vim.keymap.set('n', 'r', function()
+  map('r', function()
     refresh(buf, true)
-  end, { buffer = buf, desc = 'Refresh pipeline list' })
+  end, 'Refresh pipeline list')
 
   -- f prompts for a branch filter via `vim.ui.input` (plain text, no
   -- completion per PLAN §7.1). An empty input clears the filter; nil
   -- (user cancelled) leaves it unchanged.
-  vim.keymap.set('n', 'f', function()
-    vim.ui.input({ prompt = 'Filter by branch (empty for all): ', default = state.branch or '' }, function(input)
+  map('f', function()
+    local layout = state.context_for_buf(buf)
+    local shared = state.shared_view_for_buf('list', buf)
+    vim.ui.input({ prompt = 'Filter by branch (empty for all): ', default = (shared and shared.branch) or state.branch or '' }, function(input)
+      if layout and not state.activate(layout) then
+        return
+      end
       if input == nil then
         return
       end
-      state.branch = input ~= '' and input or nil
+      local branch = input ~= '' and input or nil
+      state.branch = branch
+      if shared then
+        shared.branch = branch
+      end
       refresh(buf)
     end)
-  end, { buffer = buf, desc = 'Filter by branch' })
+  end, 'Filter by branch')
 
   -- c clears an active branch filter (no-op if none is set).
-  vim.keymap.set('n', 'c', function()
-    if state.branch ~= nil then
+  map('c', function()
+    local shared = state.shared_view_for_buf('list', buf)
+    if (shared and shared.branch) or state.branch ~= nil then
       state.branch = nil
+      if shared then
+        shared.branch = nil
+      end
       refresh(buf)
     end
-  end, { buffer = buf, desc = 'Clear branch filter' })
+  end, 'Clear branch filter')
 
-  -- q closes the list view (teardown funneled via BufWipeout on list_buf).
-  vim.keymap.set('n', 'q', function()
-    if vim.api.nvim_buf_is_valid(buf) then
-      vim.api.nvim_buf_delete(buf, { force = true })
+  -- q closes only this panel. The list buffer may be visible in other
+  -- GlabCI windows, so it is released by the layout's WinClosed teardown.
+  map('q', function()
+    local win = state.list_win
+    if win and vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
     end
-  end, { buffer = buf, desc = 'Close pipeline list' })
+  end, 'Close pipeline list')
 end
 
 return M

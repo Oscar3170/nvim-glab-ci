@@ -116,6 +116,50 @@ local placeholder_present = false
 -- because the assignment runs before `ensure_buf` is ever called.
 local start_trace
 
+-- The module is shared by every panel, so its otherwise-private streaming
+-- state must follow the active layout rather than being one process-wide
+-- trace. `state` switches this bundle before buffer callbacks run.
+local generation = 0
+state.on_layout_switch(function(layout)
+  layout.log_view = layout.log_view
+    or {
+      log_lines = {},
+      folds = {},
+      open_sections = {},
+      pipeline_refresh = nil,
+      dismiss_refetch = false,
+      placeholder_present = false,
+      generation = 0,
+    }
+  local data = layout.log_view
+  data.log_lines = log_lines
+  data.folds = folds
+  data.open_sections = open_sections
+  data.pipeline_refresh = pipeline_refresh
+  data.dismiss_refetch = dismiss_refetch
+  data.placeholder_present = placeholder_present
+  data.generation = generation
+end, function(layout)
+  local data = layout.log_view
+    or {
+      log_lines = {},
+      folds = {},
+      open_sections = {},
+      pipeline_refresh = nil,
+      dismiss_refetch = false,
+      placeholder_present = false,
+      generation = 0,
+    }
+  layout.log_view = data
+  log_lines = data.log_lines
+  folds = data.folds
+  open_sections = data.open_sections
+  pipeline_refresh = data.pipeline_refresh
+  dismiss_refetch = data.dismiss_refetch
+  placeholder_present = data.placeholder_present
+  generation = data.generation
+end)
+
 -- `WinResized`/`VimResized` are not buffer-scoped events. Register their
 -- harmless, state-guarded callbacks once rather than once per log buffer.
 local resize_autocmds = {}
@@ -479,23 +523,24 @@ local function append_lines(buf, lines, marks)
   end
 end
 
--- Ensure the log buffer exists. Created once per layout bootstrap;
--- bootstrap; reused across all jobs. Keymaps and BufDelete cleanup are
--- attached at creation time and never re-applied.
-local function ensure_buf()
+-- Ensure a buffer exists for this job. Hidden logs are retained for normal
+-- back-navigation; another layout opening the same job releases that hidden
+-- buffer first (see `release_hidden_log`).
+local function ensure_buf(job_id)
   if state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf) then
+    vim.api.nvim_buf_set_name(state.log_buf, 'glab://ci-job-log/' .. job_id)
+    vim.b[state.log_buf].glab_ci_job_id = job_id
     return state.log_buf
   end
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].buftype = 'nofile'
   vim.bo[buf].swapfile = false
-  -- `hide` (not `wipe`) so the buffer survives being swapped out for
-  -- the pipeline buffer when the user goes back. The layout teardown
-  -- in `init.bootstrap_layout` deletes this buffer explicitly.
   vim.bo[buf].bufhidden = 'hide'
   vim.bo[buf].filetype = 'glab-ci-log'
-  vim.api.nvim_buf_set_name(buf, 'glab://ci-log')
+  vim.api.nvim_buf_set_name(buf, 'glab://ci-job-log/' .. job_id)
+  vim.b[buf].glab_ci_job_id = job_id
   state.log_buf = buf
+  state.register_buf(state.current_layout, buf)
 
   -- Section folds: `foldmethod=manual` so `[range]fold` regions created
   -- from `section_start`/`section_end` collapse. Open by default (the user
@@ -515,6 +560,7 @@ local function ensure_buf()
     buffer = buf,
     group = state.augroup,
     callback = function()
+      state.activate_for_buf(buf)
       state.kill_log_stream()
       M.restore_winbar()
     end,
@@ -524,7 +570,11 @@ local function ensure_buf()
       resize_autocmds[#resize_autocmds + 1] = vim.api.nvim_create_autocmd(event, {
         group = state.augroup,
         callback = function()
-          M.render_winbar()
+          -- A resize can affect any number of concurrent GlabCI panels.
+          for layout in pairs(state.layouts) do
+            state.activate(layout)
+            M.render_winbar()
+          end
         end,
       })
     end
@@ -537,6 +587,7 @@ local function ensure_buf()
 
   -- `f` toggles follow mode (PLAN §7.3 / §12).
   vim.keymap.set('n', 'f', function()
+    state.activate_for_buf(buf)
     state.log_follow = not state.log_follow
     M.render_winbar()
     -- When newly enabling follow, snap to bottom so the user immediately
@@ -553,6 +604,7 @@ local function ensure_buf()
   -- only the time), `o` hides/shows the whole timestamp, `T` flips between
   -- system tz and UTC, and `i` hides/shows the stream indicator.
   vim.keymap.set('n', 't', function()
+    state.activate_for_buf(buf)
     local idx = 1
     for i, p in ipairs(PREC_CYCLE) do
       if p == state.log_ts.prec then
@@ -564,22 +616,27 @@ local function ensure_buf()
     rerender()
   end, { buffer = buf, desc = 'Cycle timestamp precision (us/ms/s)' })
   vim.keymap.set('n', 'd', function()
+    state.activate_for_buf(buf)
     state.log_ts.show_date = not state.log_ts.show_date
     rerender()
   end, { buffer = buf, desc = 'Toggle timestamp date (show only time)' })
   vim.keymap.set('n', 'o', function()
+    state.activate_for_buf(buf)
     state.log_ts.show_ts = not state.log_ts.show_ts
     rerender()
   end, { buffer = buf, desc = 'Toggle whole timestamp' })
   vim.keymap.set('n', 'T', function()
+    state.activate_for_buf(buf)
     state.log_ts.local_tz = not state.log_ts.local_tz
     rerender()
   end, { buffer = buf, desc = 'Toggle timestamp timezone (system/UTC)' })
   vim.keymap.set('n', 'i', function()
+    state.activate_for_buf(buf)
     state.log_ts.show_stream = not state.log_ts.show_stream
     rerender()
   end, { buffer = buf, desc = 'Toggle stream indicator' })
   vim.keymap.set('n', 'H', function()
+    state.activate_for_buf(buf)
     state.log_header_expanded = not state.log_header_expanded
     M.render_winbar()
   end, { buffer = buf, desc = 'Toggle detailed log header' })
@@ -588,6 +645,7 @@ local function ensure_buf()
   -- follow setting is preserved (the user can flip it with `f` if they
   -- want different behavior on the refetched stream).
   vim.keymap.set('n', 'r', function()
+    state.activate_for_buf(buf)
     if not state.job_id then
       return
     end
@@ -603,21 +661,19 @@ local function ensure_buf()
   -- streaming would just churn extmarks the user can't see. Bumping the
   -- generation counter invalidates any in-flight libuv callbacks.
   local function back_to_pipeline()
+    state.activate_for_buf(buf)
     -- Kill the trace first so its callbacks (which might run after we've
     -- moved buffers around) are no-ops.
     state.kill_log_stream()
-    M._generation = M._generation + 1
+    generation = generation + 1
 
     if state.pipeline_buf and vim.api.nvim_buf_is_valid(state.pipeline_buf) and state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+      if state.current_layout then
+        state.current_layout.pipeline_showing = true
+      end
       M.restore_winbar()
       vim.api.nvim_win_set_buf(state.list_win, state.pipeline_buf)
-      -- The pipeline timer was stopped when the log opened (§8); restart.
       local refresh = pipeline_refresh
-      state.start_timer(state.pipeline_buf, 5000, function()
-        if refresh then
-          refresh()
-        end
-      end)
       if refresh then
         refresh()
       end
@@ -629,16 +685,18 @@ local function ensure_buf()
   return buf
 end
 
--- Generation counter: each `start_trace` increments it. Stale callbacks
--- from a killed previous stream (which may still fire from the libuv
--- queue) compare against `M._generation` and bail out.
-M._generation = 0
+-- Generation counter: each start increments it. Stale callbacks from a
+-- killed previous stream compare against this layout-local value and bail.
 
 -- Cancel any in-flight trace, reset parser state and buffer, kick off a
 -- new `glab ci trace <job_id>` stream. Called both from `M.open`
 -- (new job) and from the `r` keymap (re-fetch). (Assigned to the
 -- forward-declared `start_trace` local — see the declaration above.)
 start_trace = function()
+  local layout = state.context_for_buf(state.log_buf)
+  if layout then
+    state.activate(layout)
+  end
   state.kill_log_stream()
   state.ansi_state = nil
   log_lines = {}
@@ -648,8 +706,8 @@ start_trace = function()
   if state.log_buf then
     fold_names[state.log_buf] = nil
   end
-  M._generation = M._generation + 1
-  local gen = M._generation
+  generation = generation + 1
+  local gen = generation
 
   if state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf) then
     -- The trace buffer contains no header rows: loading feedback is line 1.
@@ -665,13 +723,16 @@ start_trace = function()
     -- glab.lua). We still keep the inner `vim.schedule` for symmetry /
     -- defensiveness against direct callers bypassing the wrapper.
     function(err, data)
+      if layout and not state.activate(layout) then
+        return
+      end
       if err then
         return
       end
       if not data or data == '' then
         return
       end
-      if gen ~= M._generation then
+      if gen ~= generation then
         return
       end
       -- The "Re-fetching job log…" notify is retracted once real data
@@ -714,9 +775,12 @@ start_trace = function()
     -- on_exit(obj): stream ended (either because the job finished, the
     -- user closed GlabCI, or a refetch killed us).
     function(obj)
+      if layout and not state.activate(layout) then
+        return
+      end
       -- Only act if we're still the current generation. A new stream
       -- may have started in the meantime (e.g. quick `r` presses).
-      if gen ~= M._generation then
+      if gen ~= generation then
         return
       end
       -- Retract any still-pending "Re-fetching job log…" notify (e.g. a
@@ -751,7 +815,10 @@ start_trace = function()
         -- started/finished timestamps until now.
         if state.pipeline_id then
           glab.ci_get(state.pipeline_id, function(pipeline)
-            if gen ~= M._generation then
+            if layout and not state.activate(layout) then
+              return
+            end
+            if gen ~= generation then
               return
             end
             if not state.log_buf or not vim.api.nvim_buf_is_valid(state.log_buf) then
@@ -780,6 +847,52 @@ start_trace = function()
   )
 end
 
+-- Return an already-visible log window for this job, across all tabpages.
+-- This deliberately inspects Neovim's windows rather than maintaining a
+-- second registry alongside Neovim's own buffer/window model.
+local function visible_log_window(job_id)
+  for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+      local buf = vim.api.nvim_win_get_buf(win)
+      if vim.b[buf].glab_ci_job_id == job_id then
+        return win
+      end
+    end
+  end
+end
+
+local function release_hidden_log(job_id, except_layout)
+  local name = 'glab://ci-job-log/' .. job_id
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf) == name and state.context_for_buf(buf) ~= except_layout then
+      local visible = false
+      for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+          if vim.api.nvim_win_get_buf(win) == buf then
+            visible = true
+            break
+          end
+        end
+        if visible then
+          break
+        end
+      end
+      if not visible then
+        state.activate_for_buf(buf)
+        state.delete_buf(buf)
+      end
+    end
+  end
+end
+
+local function focus_window(win)
+  local tabpage = vim.api.nvim_win_get_tabpage(win)
+  if vim.api.nvim_get_current_tabpage() ~= tabpage then
+    vim.api.nvim_set_current_tabpage(tabpage)
+  end
+  vim.api.nvim_set_current_win(win)
+end
+
 -- Public entry point: open the log of `job_id` in the layout window.
 --
 -- Args:
@@ -793,6 +906,19 @@ end
 function M.open(job, refresh_cb)
   if not job or not job.id then
     return
+  end
+  local existing = visible_log_window(job.id)
+  if existing then
+    focus_window(existing)
+    return
+  end
+  local layout = state.current_layout
+  release_hidden_log(job.id, layout)
+  state.activate(layout)
+  -- This panel now displays a log, not the shared pipeline buffer. A later
+  -- request for that pipeline must not replace this live log window.
+  if state.current_layout then
+    state.current_layout.pipeline_showing = false
   end
   pipeline_refresh = refresh_cb
   state.job_id = job.id
@@ -811,13 +937,10 @@ function M.open(job, refresh_cb)
   -- created). PLAN §10.
   state.log_follow = (job.status == 'running' or job.status == 'pending')
 
-  local buf = ensure_buf()
+  local buf = ensure_buf(job.id)
 
-  -- Stop the pipeline timer (per PLAN §8: pipeline timer paused while
-  -- the log is shown).
-  if state.pipeline_buf and vim.api.nvim_buf_is_valid(state.pipeline_buf) then
-    state.stop_timer(state.pipeline_buf)
-  end
+  -- Pipeline buffers are shared, so their refresh timer continues while a
+  -- panel follows a log; stopping it here would freeze every other viewer.
 
   -- Save the panel's local winbar before this shared window starts showing
   -- the log, then render the sticky decoration after the buffer handoff.
@@ -837,11 +960,13 @@ end
 -- via `state.delete_buf(state.log_buf)`.
 function M.shutdown()
   state.kill_log_stream()
-  M._generation = M._generation + 1 -- invalidate any pending callbacks
+  generation = generation + 1 -- invalidate any pending callbacks
   M.restore_winbar()
   folds = {}
   open_sections = {}
-  fold_names = {}
+  if state.log_buf then
+    fold_names[state.log_buf] = nil
+  end
 end
 
 return M

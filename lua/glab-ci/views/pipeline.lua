@@ -33,7 +33,7 @@ local ns = vim.api.nvim_create_namespace 'glab_ci_pipeline'
 -- buffer without a network round-trip (`M.redraw`) so transient per-job
 -- action feedback shows up immediately on keypress instead of waiting for
 -- the next `ci get`.
-local last_pipeline = nil
+local last_pipeline = {} -- pipeline buffer -> last successful response
 
 -- Coerce an optional JSON value back to a string for `string.format`.
 -- A decoded payload of the wrong shape (table / boolean instead of
@@ -274,8 +274,9 @@ end
 -- (in-flight retry / trigger / cancel markers) immediately on keypress
 -- instead of waiting for the next `ci get`.
 function M.redraw(buf)
-  if last_pipeline and vim.api.nvim_buf_is_valid(buf) then
-    render(buf, last_pipeline)
+  state.activate_for_buf(buf)
+  if last_pipeline[buf] and vim.api.nvim_buf_is_valid(buf) then
+    render(buf, last_pipeline[buf])
   end
 end
 
@@ -292,7 +293,11 @@ local function set_job_feedback(buf, job_id, text, hl, clear_ms)
   else
     state.job_action[buf][job_id] = { text = text, hl = hl or 'GlabPending' }
     if clear_ms and clear_ms > 0 then
+      local layout = state.context_for_buf(buf)
       vim.defer_fn(function()
+        if layout and not state.activate(layout) then
+          return
+        end
         local cur = state.job_action[buf] and state.job_action[buf][job_id]
         if cur and cur.text == text then
           state.job_action[buf][job_id] = nil
@@ -323,6 +328,13 @@ local function setup_keymaps(buf)
     return state.job_ids[buf] and state.job_ids[buf][lnum]
   end
 
+  local function map(lhs, callback, desc)
+    vim.keymap.set('n', lhs, function()
+      state.activate_for_current_win()
+      callback()
+    end, { buffer = buf, desc = desc })
+  end
+
   -- Stop the timer and forget per-buffer state on teardown.
   vim.api.nvim_create_autocmd('BufDelete', {
     buffer = buf,
@@ -333,12 +345,12 @@ local function setup_keymaps(buf)
   })
 
   -- Local keymaps for the pipeline view.
-  vim.keymap.set('n', 'r', function()
+  map('r', function()
     if state.inflight[buf] or not state.pipeline_id then
       return
     end
     M.refresh(buf, true)
-  end, { buffer = buf, desc = 'Refresh pipeline' })
+  end, 'Refresh pipeline')
 
   -- `<CR>` on a job opens its log in the same window via log_view.
   -- The pipeline view's 5 s timer is paused while the log is open
@@ -354,7 +366,7 @@ local function setup_keymaps(buf)
   -- exits. Passing it in instead of log.lua lazily requiring this
   -- module breaks the log ↔ pipeline require cycle structurally
   -- (review 7).
-  vim.keymap.set('n', '<CR>', function()
+  map('<CR>', function()
     local job = job_under_cursor()
     if not job then
       vim.notify('No job under cursor', vim.log.levels.WARN, { title = 'glab' })
@@ -375,10 +387,10 @@ local function setup_keymaps(buf)
     }, function()
       M.refresh(buf)
     end)
-  end, { buffer = buf, desc = 'Open job log' })
+  end, 'Open job log')
 
   -- R retries a failed job under the cursor. Notify otherwise.
-  vim.keymap.set('n', 'R', function()
+  map('R', function()
     local job = job_under_cursor()
     if not job then
       vim.notify('No job under cursor', vim.log.levels.WARN, { title = 'glab' })
@@ -389,14 +401,18 @@ local function setup_keymaps(buf)
     --   return
     -- end
     set_job_feedback(buf, job.id, '⟳ retrying…', 'GlabPending')
+    local layout = state.context_for_buf(buf)
     actions.retry(job.id, function(ok)
+      if layout and not state.activate(layout) then
+        return
+      end
       set_job_feedback(buf, job.id, ok and '✓ retried' or '✗ retry failed', ok and 'GlabSuccess' or 'GlabFailed', 3000)
       M.refresh(buf)
     end)
-  end, { buffer = buf, desc = 'Retry failed job' })
+  end, 'Retry failed job')
 
   -- T triggers a manual job under the cursor. Notify otherwise.
-  vim.keymap.set('n', 'T', function()
+  map('T', function()
     local job = job_under_cursor()
     if not job then
       vim.notify('No job under cursor', vim.log.levels.WARN, { title = 'glab' })
@@ -407,14 +423,18 @@ local function setup_keymaps(buf)
       return
     end
     set_job_feedback(buf, job.id, '⟳ triggering…', 'GlabPending')
+    local layout = state.context_for_buf(buf)
     actions.trigger(job.id, function(ok)
+      if layout and not state.activate(layout) then
+        return
+      end
       set_job_feedback(buf, job.id, ok and '✓ triggered' or '✗ trigger failed', ok and 'GlabSuccess' or 'GlabFailed', 3000)
       M.refresh(buf)
     end)
-  end, { buffer = buf, desc = 'Trigger manual job' })
+  end, 'Trigger manual job')
 
   -- C cancels a running/pending job under the cursor. Notify otherwise.
-  vim.keymap.set('n', 'C', function()
+  map('C', function()
     local job = job_under_cursor()
     if not job then
       vim.notify('No job under cursor', vim.log.levels.WARN, { title = 'glab' })
@@ -425,26 +445,33 @@ local function setup_keymaps(buf)
       return
     end
     set_job_feedback(buf, job.id, '⟳ cancelling…', 'GlabPending')
+    local layout = state.context_for_buf(buf)
     actions.cancel(job.id, function(ok)
+      if layout and not state.activate(layout) then
+        return
+      end
       set_job_feedback(buf, job.id, ok and '✓ canceled' or '✗ cancel failed', ok and 'GlabSuccess' or 'GlabFailed', 3000)
       M.refresh(buf)
     end)
-  end, { buffer = buf, desc = 'Cancel running/pending job' })
+  end, 'Cancel running/pending job')
 
-  vim.keymap.set('n', '<Esc>', function()
+  map('<Esc>', function()
     M.back_to_list()
-  end, { buffer = buf, desc = 'Back to list' })
+  end, 'Back to list')
 
-  vim.keymap.set('n', 'q', function()
+  map('q', function()
     M.back_to_list()
-  end, { buffer = buf, desc = 'Back to list' })
+  end, 'Back to list')
 end
 
 -- Create (or reuse) the pipeline buffer. Called from
 -- `M.open` exactly once per layout bootstrap.
 local function ensure_buf()
-  if state.pipeline_buf and vim.api.nvim_buf_is_valid(state.pipeline_buf) then
-    return state.pipeline_buf
+  local key = tostring(state.pipeline_id)
+  local shared = state.acquire_shared_view('pipeline', key)
+  if shared then
+    state.pipeline_buf = shared
+    return shared
   end
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].buftype = 'nofile'
@@ -453,8 +480,10 @@ local function ensure_buf()
   -- (Phase 4). Teardown deletes it explicitly.
   vim.bo[buf].bufhidden = 'hide'
   vim.bo[buf].filetype = 'glab-ci-pipeline'
+  vim.api.nvim_buf_set_name(buf, 'glab://ci-pipeline/' .. key)
 
   state.pipeline_buf = buf
+  state.set_shared_view_buf('pipeline', key, buf)
   state.job_ids[buf] = {}
 
   setup_keymaps(buf)
@@ -465,6 +494,8 @@ end
 -- (Re)fetch `glab ci get -p <id> -d -F json` and update the buffer.
 -- Guarded against overlapping refreshes.
 function M.refresh(buf, manual)
+  state.activate_for_buf(buf)
+  local layout = state.context_for_buf(buf)
   if state.inflight[buf] or not state.pipeline_id then
     return
   end
@@ -475,6 +506,9 @@ function M.refresh(buf, manual)
   end
   state.inflight[buf] = true
   glab.ci_get(state.pipeline_id, function(pipeline)
+    if layout and not state.activate(layout) then
+      return
+    end
     state.inflight[buf] = nil
     -- Dismiss the "Refreshing jobs list…" notify once the fetch returns.
     if manual then
@@ -503,7 +537,7 @@ function M.refresh(buf, manual)
       end
       return
     end
-    last_pipeline = pipeline
+    last_pipeline[buf] = pipeline
     render(buf, pipeline)
   end)
 end
@@ -517,6 +551,9 @@ end
 -- `:GlabCI` is re-run at a deeper drill-down level.
 function M.back_to_list()
   local win = state.list_win
+  if state.current_layout then
+    state.current_layout.pipeline_showing = false
+  end
 
   if
     win
@@ -526,10 +563,6 @@ function M.back_to_list()
     and vim.api.nvim_win_get_buf(win) == state.log_buf
   then
     log_view.shutdown()
-  end
-
-  if state.pipeline_buf and vim.api.nvim_buf_is_valid(state.pipeline_buf) then
-    state.stop_timer(state.pipeline_buf)
   end
 
   if win and vim.api.nvim_win_is_valid(win) and state.list_buf and vim.api.nvim_buf_is_valid(state.list_buf) then
@@ -549,7 +582,20 @@ end
 -- selecting a pipeline only swaps which buffer it displays. If the window
 -- has been torn down under us (list_win stale), bail out.
 function M.open(pipeline_id)
+  local layout = state.current_layout
+  local key = tostring(pipeline_id)
+  local old_key = layout and layout.shared_views and layout.shared_views.pipeline
+  if old_key and old_key ~= key then
+    local old_buf = state.pipeline_buf
+    if state.release_shared_view(layout, 'pipeline') then
+      state.stop_timer(old_buf)
+      state.delete_buf(old_buf)
+    end
+  end
   state.pipeline_id = pipeline_id
+  if layout then
+    layout.pipeline_showing = true
+  end
   local buf = ensure_buf()
 
   -- If the layout window is currently showing the log, kill its trace
@@ -587,13 +633,37 @@ end
 -- focuses it, and starts the per-buffer 5 s refresh timer. On failure it
 -- stays on the list (the wrapper already notified); the stale surface is
 -- never handed over.
+local function show_in_requesting_layouts(buf)
+  -- The active layout may not have switched since bootstrap, so persist its
+  -- current window fields before iterating the shared-view consumers.
+  state.sync_current_layout()
+  local shared = state.shared_view_for_buf('pipeline', buf)
+  if not shared then
+    return
+  end
+  for layout in pairs(shared.users) do
+    if layout.pipeline_showing and layout.list_win and vim.api.nvim_win_is_valid(layout.list_win) then
+      vim.api.nvim_win_set_buf(layout.list_win, buf)
+    end
+  end
+end
+
 function M.initial_load(buf)
+  state.activate_for_buf(buf)
+  local layout = state.context_for_buf(buf)
+  if last_pipeline[buf] then
+    show_in_requesting_layouts(buf)
+    return
+  end
   if state.inflight[buf] or not state.pipeline_id then
     return
   end
   vim.notify(string.format('Loading jobs for pipeline #%s…', tostring(state.pipeline_id)), vim.log.levels.INFO, { title = 'glab' })
   state.inflight[buf] = true
   glab.ci_get(state.pipeline_id, function(pipeline)
+    if layout and not state.activate(layout) then
+      return
+    end
     state.inflight[buf] = nil
     -- The "Loading jobs…" notify (shown when this load started) is
     -- dismissed once the data is in — whether it succeeded or failed.
@@ -606,17 +676,15 @@ function M.initial_load(buf)
       -- not hand the window over — stay on the list.
       return
     end
-    -- Data ready: now swap the pipeline buffer in and take focus.
-    if state.list_win and vim.api.nvim_win_is_valid(state.list_win) and vim.api.nvim_win_get_buf(state.list_win) ~= buf then
-      vim.api.nvim_win_set_buf(state.list_win, buf)
-    end
+    -- Data ready: hand the shared buffer to every panel that requested it.
+    show_in_requesting_layouts(buf)
     if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
       vim.api.nvim_set_current_win(state.list_win)
     end
     state.start_timer(buf, 5000, function()
       M.refresh(buf)
     end)
-    last_pipeline = pipeline
+    last_pipeline[buf] = pipeline
     render(buf, pipeline)
   end)
 end

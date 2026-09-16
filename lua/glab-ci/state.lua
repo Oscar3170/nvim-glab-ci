@@ -43,6 +43,7 @@ M.ids = {} -- buf -> { [lnum] = pipeline_id }
 M.job_ids = {} -- buf -> { [lnum] = { id = int, status = string, ... } }
 M.job_action = {} -- buf -> { [job_id] = { text = string, hl = string } }; transient per-job action feedback
 M.timers = {} -- buf -> uv_timer
+M.timer_layouts = {} -- buf -> layout that owns the timer callback context
 M.inflight = {} -- buf -> bool, guards against overlapping refreshes
 
 -- Single-window layout. `layout_open` is true between the first `:GlabCI`
@@ -95,6 +96,218 @@ M.log_header_expanded = false
 M.log_previous_winbar = nil
 M.log_winbar_saved = false
 
+-- Each invocation of :GlabCI owns an independent layout.  The view modules
+-- retain their small, state-module API, while this context switcher makes the
+-- layout-specific fields above point at the layout that owns the current
+-- buffer/callback.  This is important for concurrent trace streams: a
+-- callback for one panel must never overwrite another panel's job state.
+local layout_fields = {
+  'layout_open',
+  'list_win',
+  'list_buf',
+  'pipeline_buf',
+  'pipeline_id',
+  '_pipeline_id',
+  '_pipeline_ref',
+  '_pipeline_iid',
+  '_pipeline_sha',
+  'branch',
+  'log_buf',
+  'job_id',
+  '_job_name',
+  '_job_stage',
+  '_job_started_at',
+  '_job_finished_at',
+  '_job_duration',
+  'log_status',
+  'log_follow',
+  'log_job',
+  'ansi_state',
+  'log_header_expanded',
+  'log_previous_winbar',
+  'log_winbar_saved',
+}
+local defaults = {}
+for _, field in ipairs(layout_fields) do
+  defaults[field] = M[field]
+end
+
+M.layouts = {}
+M.current_layout = nil
+M.buf_layouts = {}
+M.win_layouts = {}
+-- Buffers that represent the same remote resource are shared by layouts.
+-- Entries keep their consumers so ownership can move if the layout that
+-- originally created a buffer closes first.
+M.shared_views = { list = {}, pipeline = {} }
+local switchers = {}
+
+--- Register private module state that must follow the active layout.
+function M.on_layout_switch(save, load)
+  switchers[#switchers + 1] = { save = save, load = load }
+  if M.current_layout then
+    load(M.current_layout)
+  end
+end
+
+--- Make `layout` the active state context.
+function M.sync_current_layout()
+  if not M.current_layout then
+    return
+  end
+  for _, field in ipairs(layout_fields) do
+    M.current_layout[field] = M[field]
+  end
+end
+
+function M.activate(layout)
+  -- Async callbacks may outlive a panel that was closed. Do not resurrect
+  -- its state after teardown.
+  if layout and not M.layouts[layout] then
+    return false
+  end
+  if M.current_layout == layout then
+    return true
+  end
+  if M.current_layout then
+    for _, switcher in ipairs(switchers) do
+      switcher.save(M.current_layout)
+    end
+    M.sync_current_layout()
+  end
+  M.current_layout = layout
+  if layout then
+    for _, field in ipairs(layout_fields) do
+      M[field] = layout[field]
+    end
+    for _, switcher in ipairs(switchers) do
+      switcher.load(layout)
+    end
+  end
+  return true
+end
+
+--- Create and activate a new independent GlabCI panel.
+function M.create_layout()
+  local layout = {}
+  for _, field in ipairs(layout_fields) do
+    layout[field] = defaults[field]
+  end
+  M.layouts[layout] = true
+  M.activate(layout)
+  return layout
+end
+
+function M.register_buf(layout, buf)
+  M.buf_layouts[buf] = layout
+end
+
+function M.register_win(layout, win)
+  M.win_layouts[win] = layout
+end
+
+function M.activate_for_current_win()
+  local layout = M.win_layouts[vim.api.nvim_get_current_win()]
+  if layout then
+    M.activate(layout)
+  end
+  return layout
+end
+
+--- Attach the active layout to a shared view. Returns its existing buffer,
+--- or nil when the caller must create and register a new one.
+function M.acquire_shared_view(kind, key)
+  local views = M.shared_views[kind]
+  local entry = views[key]
+  if not entry then
+    entry = { users = {} }
+    views[key] = entry
+  end
+  entry.users[M.current_layout] = true
+  M.current_layout.shared_views = M.current_layout.shared_views or {}
+  M.current_layout.shared_views[kind] = key
+  if entry.buf and vim.api.nvim_buf_is_valid(entry.buf) then
+    return entry.buf
+  end
+  return nil
+end
+
+function M.set_shared_view_buf(kind, key, buf)
+  local entry = M.shared_views[kind][key]
+  entry.buf = buf
+  M.register_buf(M.current_layout, buf)
+end
+
+function M.shared_view(kind, key)
+  return M.shared_views[kind][key]
+end
+
+function M.shared_view_for_buf(kind, buf)
+  for _, entry in pairs(M.shared_views[kind]) do
+    if entry.buf == buf then
+      return entry
+    end
+  end
+end
+
+--- Detach one layout and return true when it was the final user, in which
+--- case the caller should stop refresh work and delete the buffer.
+function M.release_shared_view(layout, kind)
+  local key = layout and layout.shared_views and layout.shared_views[kind]
+  if not key then
+    return false
+  end
+  local entry = M.shared_views[kind][key]
+  layout.shared_views[kind] = nil
+  if not entry then
+    return false
+  end
+  entry.users[layout] = nil
+  local next_owner = next(entry.users)
+  if next_owner then
+    M.buf_layouts[entry.buf] = next_owner
+    M.timer_layouts[entry.buf] = next_owner
+    return false
+  end
+  M.shared_views[kind][key] = nil
+  return true
+end
+
+function M.context_for_buf(buf)
+  return M.buf_layouts[buf]
+end
+
+function M.activate_for_buf(buf)
+  local layout = M.context_for_buf(buf)
+  if layout then
+    M.activate(layout)
+  end
+  return layout
+end
+
+function M.destroy_layout(layout)
+  if not layout then
+    return
+  end
+  M.layouts[layout] = nil
+  for buf, owner in pairs(M.buf_layouts) do
+    if owner == layout then
+      M.buf_layouts[buf] = nil
+    end
+  end
+  for win, owner in pairs(M.win_layouts) do
+    if owner == layout then
+      M.win_layouts[win] = nil
+    end
+  end
+  if M.current_layout == layout then
+    M.current_layout = nil
+    for _, field in ipairs(layout_fields) do
+      M[field] = defaults[field]
+    end
+  end
+end
+
 -- Log display preferences. Like `branch`, these survive layout teardown
 -- (they are user preferences, not per-run state), so a fresh `:GlabCI`
 -- remembers how the user had the log styled. Each is toggled independently:
@@ -139,6 +352,8 @@ function M.reset_layout()
   M.log_previous_winbar = nil
   M.log_winbar_saved = false
   M.job_action = {}
+  -- A layout teardown should not invalidate other open panels.
+  M.destroy_layout(M.current_layout)
 end
 
 -- Cancel and forget the running `glab ci trace` stream, if any. Stops the
@@ -161,6 +376,7 @@ function M.stop_timer(buf)
     t:stop()
     t:close()
     M.timers[buf] = nil
+    M.timer_layouts[buf] = nil
   end
 end
 
@@ -168,11 +384,13 @@ end
 -- the main loop thread; if the buffer has been wiped, the timer self-stops.
 function M.start_timer(buf, interval_ms, on_tick)
   M.stop_timer(buf)
+  M.timer_layouts[buf] = M.context_for_buf(buf) or M.current_layout
   local timer = uv.new_timer()
   M.timers[buf] = timer
   timer:start(interval_ms, interval_ms, function()
     vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(buf) then
+      local layout = M.timer_layouts[buf]
+      if vim.api.nvim_buf_is_valid(buf) and M.activate(layout) then
         on_tick()
       else
         M.stop_timer(buf)
