@@ -53,26 +53,6 @@ local function short_sha(sha)
   return sha:sub(1, 8)
 end
 
--- Char-aware right-pad: pads `s` with spaces to a target *character*
--- count (not byte count, which is what Lua's `string.format('%-Ns', ...)`
--- uses). Needed because the job-dur field can hold a multibyte char like
--- "—" (U+2014, 3 bytes / 1 char). With byte-aware padding, `%-8s "—"`
--- produces "—" + 5 spaces = 6 chars wide, breaking the column alignment
--- of every subsequent column (the user's report: "[failed] [skipped]
--- [success]" don't line up across rows). With char-aware padding it
--- produces "—" + 7 spaces = 8 chars wide, matching ASCII cases.
---
--- `vim.fn.strchars` is Neovim's built-in UTF-8-aware char counter.
-local function rpad(s, n)
-  if not s then
-    s = ''
-  end
-  if vim.fn.strchars(s) >= n then
-    return s
-  end
-  return s .. string.rep(' ', n - vim.fn.strchars(s))
-end
-
 -- Render the decoded pipeline object into the buffer.
 local function render(buf, pipeline)
   if not pipeline or not pipeline.id then
@@ -121,24 +101,16 @@ local function render(buf, pipeline)
       table.insert(stage_jobs[st], j)
     end
 
-    -- Stage column width. The previous hard-coded `%-10s` overflowed
-    -- for any stage name longer than 10 chars — common on terraform
-    -- repos where stages like `tf-validate` (11 chars) pushed the pipe
-    -- / glyph / name / duration columns one column to the right, so
-    -- rows no longer lined up. Compute the longest stage name in this
-    -- render and size the column to fit (with a min of 10 to keep
-    -- visually narrow pipelines from looking squished, and a hard cap
-    -- of 30 so a freakishly long stage name doesn't push the rest of
-    -- the row off the screen). Use char count (`vim.fn.strchars`) so
-    -- a future multi-byte stage name measures correctly too.
-    local stage_width = 10
+    -- Size every leading column from this response. Fixed widths let a
+    -- long stage or job name shift the status column on just that row.
+    -- Display-cell widths also keep wide Unicode names aligned.
+    local stage_width, name_width, duration_width = 11, 25, 8
     for _, j in ipairs(jobs) do
-      local n = vim.fn.strchars(j.stage or '')
-      if n > stage_width then
-        stage_width = n
-      end
+      stage_width = math.max(stage_width, vim.fn.strdisplaywidth(str(j.stage) or '') + 1)
+      name_width = math.max(name_width, vim.fn.strdisplaywidth(str(j.name) or ''))
+      local duration = util.fmt_duration(j.duration, j.status, j.started_at)
+      duration_width = math.max(duration_width, vim.fn.strdisplaywidth(duration))
     end
-    stage_width = math.min(stage_width + 1, 30)
 
     for _, st in ipairs(stage_order) do
       for _, j in ipairs(stage_jobs[st]) do
@@ -161,10 +133,10 @@ local function render(buf, pipeline)
         local fb_str = fb and (' ' .. fb.text) or ''
         local line = string.format(
           '%s │ %s %s %s [%s]%s %s',
-          rpad(str(st) or '', stage_width),
+          util.rpad_display(str(st) or '', stage_width),
           glyph,
-          rpad(str(j.name) or '', 25),
-          rpad(dur, 8),
+          util.rpad_display(str(j.name) or '', name_width),
+          util.rpad_display(dur, duration_width),
           status_str,
           fb_str,
           anno_str

@@ -32,10 +32,10 @@ return {
             stdout = [[{
               "id":42,
               "jobs":[
-                {"id":1,"name":"created","status":"created","started_at":null},
-                {"id":2,"name":"manual","status":"manual","started_at":null},
-                {"id":3,"name":"pending","status":"pending","started_at":null},
-                {"id":4,"name":"done","status":"success","started_at":"2026-01-01T00:00:00Z"}
+                {"id":1,"stage":"deploy-long-name","name":"a deliberately long job name","status":"created","started_at":null},
+                {"id":2,"stage":"build","name":"短い","status":"manual","started_at":null},
+                {"id":3,"stage":"build","name":"pending","status":"pending","started_at":null},
+                {"id":4,"stage":"build","name":"done","status":"success","started_at":"2026-01-01T00:00:00Z"}
               ]
             }]],
             stderr = '',
@@ -59,6 +59,14 @@ return {
         end)
 
         local buf, win = state.pipeline_buf, state.list_win
+        local function status_column(id)
+          local line = vim.api.nvim_buf_get_lines(buf, job_line(buf, id) - 1, job_line(buf, id), false)[1]
+          local start = assert(line:find('[', 1, true))
+          return vim.fn.strdisplaywidth(line:sub(1, start - 1))
+        end
+        h.eq(status_column(1), status_column(2))
+        h.eq(status_column(2), status_column(4))
+
         local open_log = vim.fn.maparg('<CR>', 'n', false, true).callback
         local cancel = vim.fn.maparg('C', 'n', false, true).callback
 

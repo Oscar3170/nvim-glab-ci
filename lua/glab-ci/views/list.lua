@@ -69,27 +69,52 @@ local function render(buf, pipelines, branch)
     end
   end
 
+  -- Calculate widths from this response rather than relying on fixed fields.
+  -- GitLab status names (notably `canceling`) and refs may be longer than
+  -- the old columns, which made the id, ref, and time columns drift by row.
+  local entries = {}
+  local status_width, id_width, iid_width, ref_width = 10, 8, 7, 20
   for _, p in ipairs(pipelines) do
     -- Defensive shape check (review 6): a payload that decodes to JSON
     -- but isn't shaped like a pipeline entry (missing/non-numeric id)
-    -- must not crash the scheduled render callback — `string.format`
-    -- raises on nil, which would surface as an ugly E5108-style error
-    -- in the refresh callback. Skip entries we can't map to an id.
+    -- must not crash the scheduled render callback.
     if type(p.id) == 'number' then
-      local lnum = #lines + 1
-      id_map[lnum] = p.id
-      -- Coerce optional fields: JSON values of the wrong type (tables,
-      -- booleans) would raise inside `string.format` (review 6).
       local status = type(p.status) == 'string' and p.status or '?'
-      local status_str = string.format('(%s)', status)
       local iid = type(p.iid) == 'number' and p.iid or nil
-      local iid_str = iid and string.format('(#%d)', iid) or ''
-      local ref = type(p.ref) == 'string' and p.ref or ''
-      local line = string.format('%-10s • #%-7s %-7s %-20s %s', status_str, tostring(p.id), iid_str, ref, rel_time(p.created_at))
-      table.insert(lines, line)
-      local s = highlights.STATUSES[status] or highlights.STATUSES.created
-      table.insert(marks, { lnum0 = lnum - 1, col_start = 0, col_end = #status_str, hl = s.hl })
+      local entry = {
+        id = p.id,
+        status = status,
+        status_str = string.format('(%s)', status),
+        id_str = '#' .. tostring(p.id),
+        iid_str = iid and string.format('(#%d)', iid) or '',
+        ref = type(p.ref) == 'string' and p.ref or '',
+        time = rel_time(p.created_at),
+      }
+      table.insert(entries, entry)
+      status_width = math.max(status_width, vim.fn.strdisplaywidth(entry.status_str))
+      id_width = math.max(id_width, vim.fn.strdisplaywidth(entry.id_str))
+      iid_width = math.max(iid_width, vim.fn.strdisplaywidth(entry.iid_str))
+      ref_width = math.max(ref_width, vim.fn.strdisplaywidth(entry.ref))
     end
+  end
+
+  for _, entry in ipairs(entries) do
+    local lnum = #lines + 1
+    id_map[lnum] = entry.id
+    local line = table.concat {
+      util.rpad_display(entry.status_str, status_width),
+      ' • ',
+      util.rpad_display(entry.id_str, id_width),
+      ' ',
+      util.rpad_display(entry.iid_str, iid_width),
+      ' ',
+      util.rpad_display(entry.ref, ref_width),
+      ' ',
+      entry.time,
+    }
+    table.insert(lines, line)
+    local s = highlights.STATUSES[entry.status] or highlights.STATUSES.created
+    table.insert(marks, { lnum0 = lnum - 1, col_start = 0, col_end = #entry.status_str, hl = s.hl })
   end
 
   state.ids[buf] = id_map

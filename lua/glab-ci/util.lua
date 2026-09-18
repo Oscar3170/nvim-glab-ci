@@ -102,6 +102,13 @@ function M.fmt_duration(duration, status, started_at)
   return string.format('%ds', s)
 end
 
+-- Right-pad text to a display-cell width. Unlike Lua string widths and
+-- `strchars`, this accounts for wide glyphs (for example CJK characters).
+function M.rpad_display(s, width)
+  s = type(s) == 'string' and s or ''
+  return s .. string.rep(' ', math.max(0, width - vim.fn.strdisplaywidth(s)))
+end
+
 -- Truncate long stderr/stdout in notify messages.
 function M.truncate(s, n)
   s = s or ''
