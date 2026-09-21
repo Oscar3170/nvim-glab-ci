@@ -44,7 +44,7 @@
 --        refresh — passed in from views/pipeline.lua to break the log <->
 --        pipeline require cycle (review 7).
 --   stream exit (job finished naturally)
---     -> follow -> off, re-fetch the job via one-shot `glab ci get` so
+--     -> preserve follow mode, re-fetch the job via one-shot `glab ci get` so
 --        the log header shows the finished status (review 4.4), and kick
 --        off a pipeline refresh so the pipeline view surfaces the new
 --        state.
@@ -790,8 +790,7 @@ start_trace = function()
         util.clear_msg()
       end
       state.log_job = nil
-      -- §10: stream exit -> follow -> off.
-      state.log_follow = false
+      -- Preserve the user's follow preference after the trace completes.
       if state.log_buf and vim.api.nvim_buf_is_valid(state.log_buf) then
         -- If the job produced no real output, the "Getting job trace…"
         -- placeholder is still up — drop it so it doesn't linger.

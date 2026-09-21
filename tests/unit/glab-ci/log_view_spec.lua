@@ -133,4 +133,29 @@ return {
       state.reset_layout()
     end,
   },
+  {
+    name = 'trace completion preserves follow mode',
+    run = function()
+      local win = vim.api.nvim_get_current_win()
+      local old_buf = vim.api.nvim_get_current_buf()
+      local original_trace = glab.ci_trace
+      local on_exit
+      glab.ci_trace = function(_, _, exit)
+        on_exit = exit
+        return { kill = function() end }
+      end
+
+      state.list_win = win
+      log_view.open { id = 9, name = 'test', status = 'running' }
+      h.truthy(state.log_follow)
+      on_exit { code = 1 }
+      h.truthy(state.log_follow)
+
+      log_view.shutdown()
+      glab.ci_trace = original_trace
+      vim.api.nvim_win_set_buf(win, old_buf)
+      vim.api.nvim_buf_delete(state.log_buf, { force = true })
+      state.reset_layout()
+    end,
+  },
 }
