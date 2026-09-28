@@ -29,6 +29,37 @@ return {
     end,
   },
   {
+    name = 'q tears down a list panel without closing Neovim’s final window',
+    run = function()
+      local state = require 'glab-ci.state'
+      h.with_system(function(cmd, _, callback)
+        h.eq({ 'glab', 'ci', 'list', '-F', 'json' }, cmd)
+        callback { code = 0, stdout = '[]', stderr = '' }
+        return {}
+      end, function()
+        vim.cmd 'GlabCI'
+        h.wait_until(function()
+          return state.list_buf and vim.api.nvim_buf_is_valid(state.list_buf)
+        end)
+
+        local list_win = state.list_win
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+          if win ~= list_win then
+            vim.api.nvim_win_close(win, true)
+          end
+        end
+        h.eq(1, #vim.api.nvim_tabpage_list_wins(0))
+
+        vim.api.nvim_set_current_win(list_win)
+        vim.cmd 'normal q'
+        h.wait_until(function()
+          return not state.layout_open
+        end)
+        h.eq(1, #vim.api.nvim_tabpage_list_wins(0))
+      end)
+    end,
+  },
+  {
     name = 'GlabCI opens independent panels with shared list and pipeline buffers',
     run = function()
       local state = require 'glab-ci.state'

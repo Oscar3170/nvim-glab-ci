@@ -285,11 +285,18 @@ function M.open(buf, win)
     end
   end, 'Clear branch filter')
 
-  -- q closes only this panel. The list buffer may be visible in other
-  -- GlabCI windows, so it is released by the layout's WinClosed teardown.
+  -- q closes only this panel. Neovim cannot close the final window in a
+  -- tab, so replace its buffer and explicitly tear the panel down instead.
+  -- This also preserves a shared list buffer displayed by another panel.
   map('q', function()
     local win = state.list_win
-    if win and vim.api.nvim_win_is_valid(win) then
+    if not win or not vim.api.nvim_win_is_valid(win) then
+      return
+    end
+    if #vim.api.nvim_tabpage_list_wins(0) == 1 then
+      vim.api.nvim_win_set_buf(win, vim.api.nvim_create_buf(true, false))
+      state.teardown_layout(state.current_layout)
+    else
       vim.api.nvim_win_close(win, true)
     end
   end, 'Close pipeline list')

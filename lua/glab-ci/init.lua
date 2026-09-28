@@ -81,7 +81,7 @@ local function bootstrap_layout()
   -- teardown idempotent (e.g. `q` at the list level wipes list_buf and
   -- closes the window, firing both triggers).
   local torn_down = false
-  local function teardown()
+  local function teardown(immediate)
     state.activate(layout)
     if torn_down then
       return
@@ -92,6 +92,13 @@ local function bootstrap_layout()
     -- if the user pressed `q` at the list level before ever opening a
     -- pipeline.
     local layout_win = state.list_win
+    -- Wiping the list buffer from Neovim's final tab window replaces its
+    -- buffer but cannot close that window. Remember this at teardown time:
+    -- a deferred callback may otherwise run after another split is opened
+    -- and accidentally close the user's replacement window.
+    local keep_layout_win = layout_win
+      and vim.api.nvim_win_is_valid(layout_win)
+      and #vim.api.nvim_tabpage_list_wins(vim.api.nvim_win_get_tabpage(layout_win)) == 1
     local list_buf = state.list_buf
     local pipeline_buf = state.pipeline_buf
     local log_buf = state.log_buf
@@ -114,15 +121,8 @@ local function bootstrap_layout()
     -- harmlessly when they fire.
     log_view.shutdown()
 
-    -- Wipe + close everything synchronously-safe: defer the window close
-    -- and the buffer deletes via vim.schedule. Doing either from inside
-    -- the BufWipeout autocmd of another buffer can deadlock
-    -- `nvim_buf_delete` on certain timing paths (re-entering the
-    -- buffer/window-management code while list_buf's wipe is still on the
-    -- stack). The scheduled callbacks fire after nvim_buf_delete on
-    -- list_buf returns.
-    vim.schedule(function()
-      if layout_win and vim.api.nvim_win_is_valid(layout_win) then
+    local function close_and_delete()
+      if not keep_layout_win and layout_win and vim.api.nvim_win_is_valid(layout_win) then
         pcall(vim.api.nvim_win_close, layout_win, true)
       end
       if delete_list then
@@ -132,22 +132,38 @@ local function bootstrap_layout()
         state.delete_buf(pipeline_buf)
       end
       state.delete_buf(log_buf)
-    end)
+    end
+
+    -- BufWipeout may be on the stack, so defer window and buffer management
+    -- from autocmd-triggered teardown. A final-window `q` first replaces
+    -- the panel buffer and calls this directly, where synchronous cleanup
+    -- avoids leaving a stale named buffer before a new `:GlabCI` invocation.
+    if immediate then
+      close_and_delete()
+    else
+      vim.schedule(close_and_delete)
+    end
 
     state.reset_layout()
   end
+
+  state.set_layout_teardown(layout, teardown)
 
   vim.api.nvim_create_autocmd('BufWipeout', {
     buffer = list_buf,
     group = state.augroup,
     once = true,
-    callback = teardown,
+    callback = function()
+      teardown()
+    end,
   })
   vim.api.nvim_create_autocmd('WinClosed', {
     pattern = tostring(layout_win),
     group = state.augroup,
     once = true,
-    callback = teardown,
+    callback = function()
+      teardown()
+    end,
   })
 end
 

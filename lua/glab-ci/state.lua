@@ -206,6 +206,20 @@ function M.register_win(layout, win)
   M.win_layouts[win] = layout
 end
 
+--- Register the one-shot cleanup callback for a layout. Views use this
+--- when a panel occupies its tab's final window, which cannot be closed.
+function M.set_layout_teardown(layout, callback)
+  layout.teardown = callback
+end
+
+--- Tear down a panel without closing its final tab window. This path runs
+--- outside autocmd buffer deletion, so its cleanup can complete synchronously.
+function M.teardown_layout(layout)
+  if layout and M.layouts[layout] and layout.teardown then
+    layout.teardown(true)
+  end
+end
+
 function M.activate_for_current_win()
   local layout = M.win_layouts[vim.api.nvim_get_current_win()]
   if layout then
