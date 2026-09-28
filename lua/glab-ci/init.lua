@@ -120,6 +120,7 @@ local function bootstrap_layout()
     -- generation counter so any in-flight libuv callbacks bail out
     -- harmlessly when they fire.
     log_view.shutdown()
+    require('glab-ci.views.variables').shutdown(layout)
 
     local function close_and_delete()
       if not keep_layout_win and layout_win and vim.api.nvim_win_is_valid(layout_win) then

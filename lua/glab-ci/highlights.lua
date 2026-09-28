@@ -147,6 +147,14 @@ function M.setup()
   vim.api.nvim_set_hl(0, 'GlabLogControl', { fg = '#9e9e9e' }) -- light grey
   vim.api.nvim_set_hl(0, 'GlabLogSection', { fg = '#0ea5a4' }) -- teal
   vim.api.nvim_set_hl(0, 'GlabLogCmd', { fg = '#4e9a06' }) -- green
+  local function variables_hl()
+    vim.api.nvim_set_hl(0, 'GlabVarGroup', { fg = '#ad87b9' })
+    vim.api.nvim_set_hl(0, 'GlabVarKey', { link = 'Identifier' })
+    vim.api.nvim_set_hl(0, 'GlabVarScopeDefault', { fg = '#8e8e8e' })
+    vim.api.nvim_set_hl(0, 'GlabVarIcon', { link = 'Comment' })
+    vim.api.nvim_set_hl(0, 'GlabVarHidden', { fg = '#c49068' })
+  end
+  variables_hl()
   apply_log_winbar_highlights()
   vim.api.nvim_create_autocmd('ColorScheme', {
     callback = function()
@@ -167,6 +175,7 @@ function M.setup()
       vim.api.nvim_set_hl(0, 'GlabLogControl', { fg = '#9e9e9e' })
       vim.api.nvim_set_hl(0, 'GlabLogSection', { fg = '#0ea5a4' })
       vim.api.nvim_set_hl(0, 'GlabLogCmd', { fg = '#4e9a06' })
+      variables_hl()
       apply_log_winbar_highlights()
     end,
   })

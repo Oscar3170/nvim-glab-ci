@@ -246,6 +246,10 @@ function M.open(buf, win)
     end
   end, 'Open pipeline (drill-down)')
 
+  map('v', function()
+    require('glab-ci.views.variables').open()
+  end, 'Open project CI variables')
+
   -- r triggers an immediate refresh (in addition to the 5s timer).
   map('r', function()
     refresh(buf, true)
