@@ -3,6 +3,7 @@ local state = require 'glab-ci.state'
 local api = require 'glab-ci.variables_api'
 local yaml = require 'glab-ci.variables_yaml'
 local ns = vim.api.nvim_create_namespace 'glab_ci_variables'
+local hover_ns = vim.api.nvim_create_namespace 'glab_ci_variables_key_hover'
 local sessions = {} -- private, per-layout; discarded on exit from variables view
 local journal = {} -- session only, at most three snapshots per identity
 local function valid(b)
@@ -43,6 +44,82 @@ local function pad(text, width)
   text = shorten(text, width)
   return text .. string.rep(' ', math.max(0, width - vim.fn.strdisplaywidth(text)))
 end
+local function icons(r)
+  local ascii = vim.g.glab_ci_ascii_icons == true
+  return {
+    { r.variable_type == 'file', ascii and 'F' or '󰈔', 'GlabVarIcon' },
+    { r.protected == true, ascii and 'P' or '󰌾', 'GlabVarIcon' },
+    {
+      r.hidden == true or r.masked == true,
+      ascii and (r.hidden == true and 'H' or 'M') or '󰈉',
+      r.hidden == true and 'GlabVarHidden' or 'GlabVarIcon',
+    },
+  }
+end
+local function icon_text(r)
+  local text = ''
+  for _, icon in ipairs(icons(r)) do
+    text = text .. (icon[1] and icon[2] or ' ')
+  end
+  return text
+end
+local function preview(s, r)
+  -- Hidden layout measurement must not inspect the contents of a value.
+  return type(r.value) ~= 'string' and 'unavailable' or (s.reveal and clean(r.value) or '••••••')
+end
+local function columns(s, entries, width)
+  local maxkey, maxdesc, maxscope, maxicons, maxvalue = 1, 0, 1, 0, 0
+  for _, r in ipairs(entries) do
+    maxkey = math.max(maxkey, vim.fn.strdisplaywidth(clean(r.key)))
+    maxdesc = math.max(maxdesc, vim.fn.strdisplaywidth(clean(r.description)))
+    maxscope = math.max(maxscope, vim.fn.strdisplaywidth(clean(r.environment_scope or '*')))
+    maxicons = math.max(maxicons, vim.fn.strdisplaywidth(icon_text(r)))
+    maxvalue = math.max(maxvalue, vim.fn.strdisplaywidth(preview(s, r)))
+  end
+  local c = {
+    key = 1,
+    icons = maxicons,
+    scope = math.min(18, math.max(1, math.floor(width * 0.16)), maxscope),
+    description = s.descriptions and math.ceil(width * 0.20) or 0,
+    value = s.reveal and math.ceil(width * 0.20) or maxvalue,
+  }
+  local function used()
+    local total = c.key
+    for _, field in ipairs { 'icons', 'scope', 'description', 'value' } do
+      if c[field] > 0 then
+        total = total + c[field] + (field == 'value' and 2 or 1)
+      end
+    end
+    return total
+  end
+  -- Percentage floors are best-effort only if the fixed costs cannot fit.
+  if used() > width then
+    c.icons = 0
+  end
+  while used() > width and c.scope > 1 do
+    c.scope = c.scope - 1
+  end
+  while used() > width and c.description > 0 do
+    c.description = c.description - 1
+  end
+  if used() > width then
+    c.scope = 0
+  end
+  while used() > width and c.value > 0 do
+    c.value = c.value - 1
+  end
+  local extra = width - used()
+  local add = math.min(extra, maxkey - c.key)
+  c.key, extra = c.key + add, extra - add
+  if c.description > 0 then
+    add = math.min(extra, math.max(0, maxdesc - c.description))
+    c.description, extra = c.description + add, extra - add
+  end
+  if s.reveal and (c.value > 0 or extra > 2) then
+    c.value = c.value + extra - (c.value == 0 and 2 or 0)
+  end
+  return c
+end
 local function label(r)
   return r.owner.path .. ' / ' .. r.key .. ' [' .. (r.environment_scope or '*') .. ']'
 end
@@ -52,6 +129,19 @@ end
 local function selected(s)
   return s.rows[vim.api.nvim_win_get_cursor(s.win)[1]]
 end
+local function hover_key(s)
+  vim.api.nvim_buf_clear_namespace(s.buf, hover_ns, 0, -1)
+  local row = vim.api.nvim_win_get_cursor(s.win)[1]
+  local key = s.truncated_keys[row]
+  if key and vim.api.nvim_get_current_win() == s.win then
+    -- Overlay is visual only: the buffer row and its selection/metadata stay intact.
+    vim.api.nvim_buf_set_extmark(s.buf, hover_ns, row - 1, 0, {
+      virt_text = { { shorten(key, s.text_width), 'GlabVarKey' } },
+      virt_text_pos = 'overlay',
+      hl_mode = 'replace',
+    })
+  end
+end
 local function header(s)
   if not live(s) then
     return
@@ -59,11 +149,6 @@ local function header(s)
   local title = 'CI Variables  ' .. (s.project and s.project.path_with_namespace or 'project')
   if s.groups then
     title = title .. '  + groups'
-  end
-  if s.loading then
-    title = title .. '  loading…'
-  elseif s.error then
-    title = title .. '  ! error'
   end
   title = shorten(title, math.max(1, vim.api.nvim_win_get_width(s.win) - 2))
   vim.wo[s.win].winbar = '%#GlabLogWinbarTitle# ' .. title:gsub('%%', '%%%%') .. ' '
@@ -78,70 +163,64 @@ function M.render(s)
   local old = s.rows[cursor[1]]
   local target = s.selection or (old and identity(old))
   local lines = {}
-  if s.error then
-    lines[#lines + 1] = shorten(' ! ' .. s.error, width)
-  end
   local rows, marks, landing = {}, {}, nil
+  local truncated_keys = {}
   for index, owner in ipairs(s.owners or {}) do
-    if index == 1 or s.groups then
+    if (index == 1 or s.groups) and (s.completed[owner.path] or s.pending_owner == owner.path) then
       -- The winbar already names the project. Only ancestors need a small
       -- path label to distinguish duplicate keys owned by different groups.
       if owner.kind == 'group' then
         lines[#lines + 1] = shorten(clean(owner.path), width)
         marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabVarGroup' }
       end
-      local entries = s.entries[owner.path] or {}
-      if s.owner_errors and s.owner_errors[owner.path] then
-        lines[#lines + 1] = shorten('   ! ' .. s.owner_errors[owner.path], width)
-      elseif #entries == 0 then
+      local completed = s.completed[owner.path]
+      local entries = completed and (s.entries[owner.path] or {}) or {}
+      if completed and s.owner_errors[owner.path] then
+        lines[#lines + 1] = ' ! ' .. clean(s.owner_errors[owner.path])
+        marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabVarError' }
+      elseif completed and #entries == 0 then
         lines[#lines + 1] = '   (no variables)'
       end
+      local cols = #entries > 0 and columns(s, entries, width) or nil
       for _, r in ipairs(entries) do
         local line_no = #lines + 1
         rows[line_no] = r
         if identity(r) == target then
           landing = line_no
         end
-        local keyw = math.min(24, math.max(3, math.floor(width * 0.26)))
-        local scopew = math.min(18, math.max(1, math.floor(width * 0.16)))
-        local descw = width >= 50 and math.min(28, math.floor(width * 0.20)) or 0
-        local ascii = vim.g.glab_ci_ascii_icons == true
-        local icons = (r.variable_type == 'file' and (ascii and 'F' or '󰈔') or ' ')
-          .. (r.protected == true and (ascii and 'P' or '󰌾') or ' ')
-          .. (r.hidden == true and (ascii and 'H' or '󰈉') or r.masked == true and (ascii and 'M' or '󰈉') or ' ')
-        local prefix = pad(r.key, keyw)
-        marks[#marks + 1] = { line_no - 1, 0, #shorten(r.key, keyw), 'GlabVarKey' }
-        if width >= 22 then
+        local key = clean(r.key)
+        if vim.fn.strdisplaywidth(key) > cols.key then
+          truncated_keys[line_no] = key
+        end
+        local prefix = pad(key, cols.key)
+        marks[#marks + 1] = { line_no - 1, 0, #shorten(key, cols.key), 'GlabVarKey' }
+        if cols.icons > 0 then
           prefix = prefix .. ' '
           local at = #prefix
-          prefix = prefix .. icons
-          for _, icon in ipairs {
-            { r.variable_type == 'file', ascii and 'F' or '󰈔', 'GlabVarIcon' },
-            { r.protected == true, ascii and 'P' or '󰌾', 'GlabVarIcon' },
-            {
-              r.hidden == true or r.masked == true,
-              ascii and (r.hidden == true and 'H' or 'M') or '󰈉',
-              r.hidden == true and 'GlabVarHidden' or 'GlabVarIcon',
-            },
-          } do
+          prefix = prefix .. pad(icon_text(r), cols.icons)
+          for _, icon in ipairs(icons(r)) do
             if icon[1] then
               marks[#marks + 1] = { line_no - 1, at, at + #icon[2], icon[3] }
             end
             at = at + (icon[1] and #icon[2] or 1)
           end
         end
-        prefix = prefix .. ' '
-        local scope = shorten(r.environment_scope or '*', scopew)
-        local scope_start = #prefix
-        prefix = prefix .. pad(scope, scopew) .. ' '
-        if r.environment_scope == '*' then
-          marks[#marks + 1] = { line_no - 1, scope_start, scope_start + #scope, 'GlabVarScopeDefault' }
+        if cols.scope > 0 then
+          prefix = prefix .. ' '
+          local scope = shorten(r.environment_scope or '*', cols.scope)
+          local scope_start = #prefix
+          prefix = prefix .. pad(scope, cols.scope)
+          if r.environment_scope == '*' then
+            marks[#marks + 1] = { line_no - 1, scope_start, scope_start + #scope, 'GlabVarScopeDefault' }
+          end
         end
-        if descw > 0 then
-          prefix = prefix .. pad(r.description or '', descw) .. ' '
+        if cols.description > 0 then
+          prefix = prefix .. ' ' .. pad(r.description, cols.description)
         end
-        local preview = type(r.value) ~= 'string' and 'unavailable' or (s.reveal and clean(r.value) or '••••••')
-        lines[#lines + 1] = shorten(prefix .. preview, width)
+        if cols.value > 0 then
+          prefix = prefix .. '  ' .. shorten(preview(s, r), cols.value)
+        end
+        lines[#lines + 1] = prefix
         if s.expanded[identity(r)] then
           local value = type(r.value) == 'string' and r.value or 'unavailable'
           -- Only real newlines create buffer rows. Long source lines wrap
@@ -155,10 +234,22 @@ function M.render(s)
           end
         end
       end
-      lines[#lines + 1] = ''
+      if completed then
+        lines[#lines + 1] = ''
+      end
     end
   end
+  if s.error then
+    lines[#lines + 1] = ' ! ' .. clean(s.error)
+    marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabVarError' }
+  end
+  if s.loading or s.resolving then
+    lines[#lines + 1] = ' Loading variables…'
+    marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabDim' }
+  end
   s.rows = rows
+  s.truncated_keys = truncated_keys
+  s.text_width = width
   vim.bo[s.buf].modifiable = true
   vim.api.nvim_buf_set_lines(s.buf, 0, -1, false, lines)
   vim.bo[s.buf].modifiable = false
@@ -186,35 +277,67 @@ function M.render(s)
     end
   end
   s.selection = nil
+  hover_key(s)
   header(s)
 end
-local function fetch(s, groups)
-  if not live(s) or s.loading then
+local function fetch(s, keep_error, restart)
+  -- Repeated r is ignored. Visibility changes and completed writes invalidate
+  -- the request instead, so a late response can never commit the wrong set.
+  if not live(s) or (s.loading and not restart) or not s.owners then
     return
   end
+  s.generation = (s.generation or 0) + 1
+  local generation = s.generation
+  local owners = s.groups and vim.list_slice(s.owners) or { s.owners[1] }
+  local entries, completed, errors = {}, {}, {}
+  local atomic = s.committed
+  local failed = false
+  local function current()
+    return live(s) and s.generation == generation
+  end
   s.loading = true
-  s.error = nil
+  if not keep_error then
+    s.error = nil
+  end
+  if not atomic then
+    s.entries, s.completed, s.owner_errors = entries, completed, errors
+  end
+  s.pending_owner = nil
   M.render(s)
-  local owners = groups and s.owners or { s.owners[1] }
-  local entries, errors, n = {}, {}, 1
+  local n = 1
   local function next_owner()
-    if not live(s) then
+    if not current() then
       return
     end
     local owner = owners[n]
     if not owner then
       s.loading = false
-      for path, list in pairs(entries) do
-        s.entries[path] = list
-        s.owner_errors[path] = nil
+      s.pending_owner = nil
+      if not failed then
+        s.entries, s.completed, s.owner_errors = entries, completed, errors
+        s.committed = true
+        local surviving = {}
+        for _, items in pairs(entries) do
+          for _, r in ipairs(items) do
+            surviving[identity(r)] = true
+          end
+        end
+        for id in pairs(s.expanded) do
+          if not surviving[id] then
+            s.expanded[id] = nil
+          end
+        end
       end
-      s.error = #errors > 0 and table.concat(errors, '; ') or nil
       M.render(s)
       return
     end
     n = n + 1
+    if not atomic then
+      s.pending_owner = owner.path
+      M.render(s)
+    end
     api.list(owner, function(items, err)
-      if not live(s) then
+      if not current() then
         return
       end
       if items then
@@ -223,8 +346,20 @@ local function fetch(s, groups)
         end
         entries[owner.path] = items
       else
-        s.owner_errors[owner.path] = err or 'read failed (check permissions / tier)'
-        errors[#errors + 1] = owner.path .. ': ' .. s.owner_errors[owner.path]
+        local message = clean(err or 'read failed (check permissions / tier)')
+        if atomic then
+          s.loading = false
+          s.error = clean(owner.path) .. ': ' .. message
+          M.render(s)
+          return
+        end
+        failed = true
+        errors[owner.path] = message
+      end
+      completed[owner.path] = true
+      if not atomic then
+        s.pending_owner = nil
+        M.render(s)
       end
       next_owner()
     end)
@@ -441,7 +576,7 @@ local function run_changes(s, changes, editor, on_success)
     else
       warn(s, message)
     end
-    fetch(s, s.groups)
+    fetch(s, not editor, true)
   end
   local function step(i)
     if not live(s) then
@@ -453,7 +588,7 @@ local function run_changes(s, changes, editor, on_success)
         wipe(editor.buf)
         s.editor = nil
       end
-      fetch(s, s.groups)
+      fetch(s, false, true)
       if on_success then
         on_success()
       end
@@ -680,20 +815,32 @@ local function help(s)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
     'Variables • keys',
     '',
-    'r refresh  <leader>G include ancestor groups  H reveal/hide all values',
-    '<CR> expand/collapse full value  e edit row  E edit visible rows',
-    '% create project  g% create group  D delete  U restore version',
-    '<leader>? help  q / <Esc> back (or dismiss help)',
+    'r refresh (keep rows until every owner succeeds)',
+    '<leader>G include/hide ancestor groups',
+    'td toggle descriptions (initially shown)',
+    'th toggle previews (initially hidden); hiding collapses values',
+    '<CR> expand/collapse full value',
+    'e edit row  E edit visible rows',
+    '% create project  g% create group',
+    'D delete  U restore version',
+    '<leader>? help  q / <Esc> back / dismiss',
     '',
-    '󰈔 file variable   󰌾 protected   󰈉 masked / hidden',
-    'Fallback: set vim.g.glab_ci_ascii_icons = true for F / P / M / H.',
-    'Project in winbar; ancestor paths label group rows. Scopes do not merge.',
+    'Each owner aligns separately; keys get spare width first.',
+    'Descriptions / revealed values reserve 20% each.',
+    'Very narrow windows reduce these floors to fit.',
+    '󰈔 file  󰌾 protected  󰈉 masked / hidden',
+    'ASCII: vim.g.glab_ci_ascii_icons = true (F / P / M / H).',
   })
-  local win = vim.api.nvim_open_win(
-    buf,
-    true,
-    { relative = 'editor', row = 2, col = 2, width = math.max(20, math.min(vim.o.columns - 4, 75)), height = 11, style = 'minimal', border = 'rounded' }
-  )
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    row = 1,
+    col = 1,
+    width = math.max(1, math.min(vim.o.columns - 4, 75)),
+    height = math.max(1, math.min(vim.o.lines - 5, 18)),
+    style = 'minimal',
+    border = 'rounded',
+  })
+  vim.wo[win].wrap = true
   local popup = { buf = buf, win = win }
   s.help = popup
   vim.api.nvim_create_autocmd('WinClosed', {
@@ -766,10 +913,13 @@ function M.open()
     previous_wrap = vim.wo[win].wrap,
     entries = {},
     owner_errors = {},
+    completed = {},
+    resolving = true,
     rows = {},
     expanded = {},
     groups = false,
     reveal = false,
+    descriptions = true,
   }
   sessions[layout] = s
   vim.api.nvim_win_set_buf(win, buf)
@@ -794,6 +944,24 @@ function M.open()
       end
     end,
   })
+  vim.api.nvim_create_autocmd({ 'CursorMoved', 'WinEnter' }, {
+    group = state.augroup,
+    buffer = buf,
+    callback = function()
+      if live(s) and vim.api.nvim_get_current_win() == s.win then
+        hover_key(s)
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd('WinLeave', {
+    group = state.augroup,
+    buffer = buf,
+    callback = function()
+      if valid(buf) then
+        vim.api.nvim_buf_clear_namespace(buf, hover_ns, 0, -1)
+      end
+    end,
+  })
   s.resize_autocmd = vim.api.nvim_create_autocmd('WinResized', {
     group = state.augroup,
     callback = function()
@@ -811,17 +979,21 @@ function M.open()
     end, { buffer = buf })
   end
   map('r', function()
-    fetch(s, s.groups)
+    fetch(s)
   end)
   map('<leader>G', function()
     s.groups = not s.groups
-    if s.groups then
-      fetch(s, true)
+    if s.owners and (s.loading or s.groups) then
+      fetch(s, false, true)
     else
       M.render(s)
     end
   end)
-  map('H', function()
+  map('td', function()
+    s.descriptions = not s.descriptions
+    M.render(s)
+  end)
+  map('th', function()
     s.reveal = not s.reveal
     if not s.reveal then
       s.expanded = {}
@@ -849,7 +1021,7 @@ function M.open()
   map('E', function()
     local all = {}
     for i, owner in ipairs(s.owners or {}) do
-      if i == 1 or s.groups then
+      if (i == 1 or s.groups) and s.completed[owner.path] then
         vim.list_extend(all, s.entries[owner.path] or {})
       end
     end
@@ -978,12 +1150,13 @@ function M.open()
     if not live(s) then
       return
     end
+    s.resolving = false
     if not project then
-      return warn(s, err)
+      return warn(s, err or 'Failed to resolve current project')
     end
     s.project = project
     s.owners = api.owners(project)
-    fetch(s, false)
+    fetch(s)
   end)
   M.render(s)
 end

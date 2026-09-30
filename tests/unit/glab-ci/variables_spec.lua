@@ -198,6 +198,111 @@ return {
       changes, err = yaml.reconcile(parse(yaml.emit({ new }, 'create')), {}, 'create', new.owner)
       h.eq(nil, changes)
       h.truthy(err:find('Hidden', 1, true))
+      new.hidden = false
+      new.key = string.rep('K', 255)
+      h.eq(1, #assert(yaml.reconcile(parse(yaml.emit({ new }, 'create')), {}, 'create', new.owner)))
+      new.key = new.key .. 'K'
+      changes, err = yaml.reconcile(parse(yaml.emit({ new }, 'create')), {}, 'create', new.owner)
+      h.eq(nil, changes)
+      h.truthy(err:find('key', 1, true) or err:find('Key', 1, true))
+    end,
+  },
+  {
+    name = 'variables load owners sequentially with a trailing indicator and full inline errors',
+    run = function()
+      local state = require 'glab-ci.state'
+      local original_project, original_list = api.project, api.list
+      local project_cb, requests
+      requests = {}
+      api.project = function(cb)
+        project_cb = cb
+      end
+      api.list = function(owner, cb)
+        requests[#requests + 1] = { owner = owner, cb = cb }
+      end
+      local ok, err = xpcall(function()
+        h.with_system(function(_, _, cb)
+          cb { code = 0, stdout = '[]' }
+          return {}
+        end, function()
+          vim.cmd 'GlabCI'
+          local win = state.list_win
+          vim.cmd 'normal v'
+          local buf = vim.api.nvim_win_get_buf(win)
+          local function lines()
+            return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+          end
+          h.eq({ ' Loading variables…' }, lines())
+          h.eq(false, vim.wo[win].winbar:find('loading', 1, true) ~= nil)
+          project_cb(project)
+          h.eq('team/platform/app', requests[1].owner.path)
+          h.eq({ ' Loading variables…' }, lines())
+          vim.api.nvim_feedkeys((vim.g.mapleader or '\\') .. 'G', 'xt', false)
+          h.eq(false, vim.tbl_contains(lines(), 'team/platform')) -- project still pending
+          h.eq(false, vim.tbl_contains(lines(), '   (no variables)'))
+          h.eq('team/platform/app', requests[2].owner.path) -- visibility restarted fetch
+          requests[1].cb { vim.deepcopy(record) } -- canceled callback is ignored
+          h.eq({ ' Loading variables…' }, lines())
+          requests[2].cb { vim.deepcopy(record) }
+          h.eq('team/platform', requests[3].owner.path)
+          h.truthy(lines()[1]:match '^S')
+          h.eq(' Loading variables…', lines()[#lines()])
+          h.truthy(vim.tbl_contains(lines(), 'team/platform')) -- project finished; this group is now loading
+          h.eq(false, vim.tbl_contains(lines(), 'team'))
+          h.eq(false, vim.tbl_contains(lines(), '   (no variables)'))
+          local failure = 'GitLab request failed; check permissions ' .. string.rep('detail-', 40)
+          requests[3].cb(nil, failure)
+          h.eq('team', requests[4].owner.path)
+          local result = lines()
+          h.eq(false, result[1]:find('!', 1, true) ~= nil)
+          h.truthy(vim.tbl_contains(result, 'team/platform'))
+          h.truthy(vim.tbl_contains(result, ' ! ' .. failure))
+          h.truthy(vim.tbl_contains(result, 'team')) -- only shown after the preceding group failed
+          h.truthy(vim.fn.index(result, ' ! ' .. failure) < vim.fn.index(result, 'team'))
+          h.eq(false, vim.tbl_contains(result, '   (no variables)'))
+          h.eq(' Loading variables…', result[#result])
+          h.eq(true, vim.wo[win].wrap)
+          h.truthy(vim.fn.strdisplaywidth(' ! ' .. failure) > vim.api.nvim_win_get_width(win))
+          requests[4].cb(nil, 'Not permitted')
+          result = lines()
+          h.eq(false, vim.tbl_contains(result, ' Loading variables…'))
+          h.truthy(vim.tbl_contains(result, 'team'))
+          h.truthy(vim.tbl_contains(result, ' ! Not permitted'))
+          h.eq(false, vim.wo[win].winbar:find('error', 1, true) ~= nil)
+          vim.cmd 'normal r'
+          h.eq({ ' Loading variables…' }, lines())
+          requests[5].cb {}
+          h.truthy(vim.tbl_contains(lines(), '   (no variables)'))
+          h.eq(false, vim.tbl_contains(lines(), ' ! ' .. failure)) -- stale group error is hidden during refresh
+          h.eq(' Loading variables…', lines()[#lines()])
+          -- Hiding groups invalidates the outstanding group request.
+          vim.api.nvim_feedkeys((vim.g.mapleader or '\\') .. 'G', 'xt', false)
+          requests[6].cb {}
+          h.eq(' Loading variables…', lines()[#lines()])
+          requests[7].cb {}
+          h.eq(false, vim.tbl_contains(lines(), ' Loading variables…'))
+          vim.cmd 'normal q'
+          vim.cmd 'GlabCI'
+          local failed_win = state.list_win
+          vim.cmd 'normal v'
+          local failed_buf = vim.api.nvim_win_get_buf(failed_win)
+          h.eq({ ' Loading variables…' }, vim.api.nvim_buf_get_lines(failed_buf, 0, -1, false))
+          local project_failure = 'Failed to resolve project ' .. string.rep('id/', 30)
+          project_cb(nil, project_failure)
+          h.eq({ ' ! ' .. project_failure }, vim.api.nvim_buf_get_lines(failed_buf, 0, -1, false))
+          vim.cmd 'normal q' -- variables -> list
+          vim.cmd 'normal q' -- close second list panel
+          vim.api.nvim_set_current_win(win)
+          vim.cmd 'normal q' -- close first list panel
+          h.wait_until(function()
+            return next(state.layouts) == nil and vim.fn.bufnr 'glab://ci-list' == -1
+          end)
+        end)
+      end, debug.traceback)
+      api.project, api.list = original_project, original_list
+      if not ok then
+        error(err)
+      end
     end,
   },
   {
@@ -225,6 +330,7 @@ return {
           local win1 = state.list_win
           vim.cmd 'normal v'
           local buf1 = vim.api.nvim_win_get_buf(win1)
+          local default_lines = vim.api.nvim_buf_get_lines(buf1, 0, -1, false)
           vim.cmd 'GlabCI'
           local win2 = state.list_win
           local prior_wrap = vim.wo[win2].wrap
@@ -257,7 +363,9 @@ return {
           vim.api.nvim_exec_autocmds('CursorMoved', { buffer = buf2 })
           h.eq(title, vim.wo[win2].winbar)
           vim.api.nvim_win_set_cursor(win2, { row, 0 })
-          vim.cmd 'normal H'
+          vim.cmd 'normal th'
+          vim.cmd 'normal td'
+          h.eq(default_lines, vim.api.nvim_buf_get_lines(buf1, 0, -1, false)) -- both toggles are panel-local
           line = vim.api.nvim_buf_get_lines(buf2, row - 1, row, false)[1]
           h.truthy(line:sub(-3) == '…')
           local text_width = vim.api.nvim_win_get_width(win2) - vim.fn.getwininfo(win2)[1].textoff
@@ -304,6 +412,86 @@ return {
       end, debug.traceback)
       api.project, api.list = original_project, original_list
       vim.g.glab_ci_ascii_icons = old_ascii
+      if not ok then
+        error(err)
+      end
+    end,
+  },
+  {
+    name = 'variable keys use free width and show long keys over columns on cursor hover',
+    run = function()
+      local state = require 'glab-ci.state'
+      local original_project, original_list = api.project, api.list
+      local columns, old_ascii = vim.o.columns, vim.g.glab_ci_ascii_icons
+      vim.g.glab_ci_ascii_icons = true
+      local key = 'INTERPLAY_WS_USERNAME_HML_DEPLOYMENT_ENV'
+      local long_key = string.rep('K', 255)
+      api.project = function(cb)
+        cb(project)
+      end
+      api.list = function(_, cb)
+        local a, b = vim.deepcopy(record), vim.deepcopy(record)
+        a.key, b.key = key, long_key
+        a.variable_type, a.protected, a.hidden = 'file', true, true
+        cb { a, b }
+      end
+      local ok, err = xpcall(function()
+        h.with_system(function(_, _, cb)
+          cb { code = 0, stdout = '[]' }
+          return {}
+        end, function()
+          vim.o.columns = 140
+          vim.cmd 'GlabCI'
+          local win = state.list_win
+          vim.cmd 'normal v'
+          local buf = vim.api.nvim_win_get_buf(win)
+          local function line(row)
+            return vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
+          end
+          local hover_ns = vim.api.nvim_get_namespaces().glab_ci_variables_key_hover
+          local function hovered(row)
+            return vim.api.nvim_buf_get_extmarks(buf, hover_ns, { row - 1, 0 }, { row - 1, -1 }, { details = true })
+          end
+          h.truthy(line(1):sub(1, #key) == key)
+          h.truthy(line(1):find('FPH *', 1, true) ~= nil)
+          h.eq(vim.fn.strdisplaywidth(line(1):sub(1, line(1):find('*', 1, true) - 1)), vim.fn.strdisplaywidth(line(2):sub(1, line(2):find('*', 1, true) - 1))) -- shared key display width, not byte width
+          h.eq(0, #hovered(1))
+          h.truthy(line(2):find('…', 1, true) ~= nil)
+          vim.api.nvim_win_set_cursor(win, { 2, 0 })
+          vim.api.nvim_exec_autocmds('CursorMoved', { buffer = buf })
+          local marks = hovered(2)
+          h.eq(1, #marks)
+          h.eq(0, marks[1][3])
+          h.eq('overlay', marks[1][4].virt_text_pos)
+          h.truthy(marks[1][4].virt_text[1][1]:sub(1, 40) == string.rep('K', 40))
+          h.truthy(vim.fn.strdisplaywidth(marks[1][4].virt_text[1][1]) <= vim.api.nvim_win_get_width(win))
+          vim.api.nvim_win_set_cursor(win, { 1, 0 })
+          vim.api.nvim_exec_autocmds('CursorMoved', { buffer = buf })
+          h.eq(0, #hovered(2))
+          vim.cmd 'vnew'
+          local side_win = vim.api.nvim_get_current_win()
+          vim.api.nvim_set_current_win(win)
+          vim.api.nvim_win_set_width(win, 44)
+          vim.api.nvim_exec_autocmds('WinResized', {})
+          h.truthy(line(1):find('…', 1, true) ~= nil)
+          h.eq(1, #hovered(1))
+          h.eq(key, hovered(1)[1][4].virt_text[1][1]) -- full key fits over scope and preview
+          h.truthy(line(1):sub(1, 8) == key:sub(1, 8)) -- overlay did not change buffer text
+          vim.api.nvim_set_current_win(side_win)
+          h.eq(0, #hovered(1))
+          vim.api.nvim_set_current_win(win)
+          h.eq(1, #hovered(1))
+          vim.cmd 'normal q' -- variables -> list
+          vim.cmd 'normal q' -- close list
+          vim.api.nvim_win_close(side_win, true)
+          h.wait_until(function()
+            return next(state.layouts) == nil and vim.fn.bufnr 'glab://ci-list' == -1
+          end)
+        end)
+      end, debug.traceback)
+      vim.o.columns = columns
+      vim.g.glab_ci_ascii_icons = old_ascii
+      api.project, api.list = original_project, original_list
       if not ok then
         error(err)
       end

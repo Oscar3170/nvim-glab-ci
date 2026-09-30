@@ -149,6 +149,7 @@ function M.setup()
   vim.api.nvim_set_hl(0, 'GlabLogCmd', { fg = '#4e9a06' }) -- green
   local function variables_hl()
     vim.api.nvim_set_hl(0, 'GlabVarGroup', { fg = '#ad87b9' })
+    vim.api.nvim_set_hl(0, 'GlabVarError', { link = 'DiagnosticError' })
     vim.api.nvim_set_hl(0, 'GlabVarKey', { link = 'Identifier' })
     vim.api.nvim_set_hl(0, 'GlabVarScopeDefault', { fg = '#8e8e8e' })
     vim.api.nvim_set_hl(0, 'GlabVarIcon', { link = 'Comment' })
