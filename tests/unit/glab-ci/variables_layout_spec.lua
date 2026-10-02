@@ -46,6 +46,7 @@ return {
             local starts = {}
             for i, path in ipairs { 'team/platform/app', 'team/platform', 'team' } do
               if i > 1 then
+                expected[#expected + 1] = ''
                 expected[#expected + 1] = path
               end
               local scope = ({ 4, math.min(18, math.floor(W * 0.16)), 5 })[i]
@@ -74,7 +75,6 @@ return {
                 expected[#expected + 1] = line
                 h.truthy(vim.fn.strdisplaywidth(line) <= W)
               end
-              expected[#expected + 1] = ''
             end
             h.eq(expected, v.lines(buf), string.format('width=%d td=%s th=%s', width, descriptions, revealed))
             h.truthy(starts[2] ~= starts[3]) -- no cross-owner alignment
@@ -105,7 +105,7 @@ return {
         v.keys '<CR>'
         h.eq(string.rep('v', 200), v.lines(buf)[7])
         v.keys 'th'
-        h.eq(11, #v.lines(buf)) -- hiding collapses expanded values
+        h.eq(10, #v.lines(buf)) -- hiding collapses expanded values; no trailing separator
         local maps = vim.api.nvim_buf_get_keymap(buf, 'n')
         for _, map in ipairs(maps) do
           h.truthy(map.lhs ~= 'H')
@@ -129,7 +129,7 @@ return {
           { 2, '…' },
         } do
           local W = resize(fixture[1])
-          h.eq({ fixture[2], '' }, v.lines(buf))
+          h.eq({ fixture[2] }, v.lines(buf))
           h.truthy(vim.fn.strdisplaywidth(fixture[2]) <= W)
         end
         records = { row('S', '*', ''), row(string.rep('K', 67), 'prod', string.rep('d', 30)) }
@@ -144,6 +144,31 @@ return {
         h.eq(false, table.concat(lines):find('PRIVATE', 1, true) ~= nil)
         v.keys 'td' -- no description column or separator; the full key now fits
         h.eq(field(records[2].key, 67) .. ' FPM prod  unavailable', v.lines(buf)[2])
+      end)
+    end,
+  },
+  {
+    name = 'section separators do not add a final blank row or remove real expanded value newlines',
+    run = function()
+      v.with_panel(project, function(owner, cb)
+        local r = row('S', '*', '')
+        r.value = owner.path .. '\n'
+        cb { r }
+      end, function(win, buf, resize)
+        resize(100)
+        local preview = v.lines(buf)[1]
+        h.eq({ preview }, v.lines(buf))
+        v.keys '<CR>'
+        h.eq({ preview, 'team/platform/app', '' }, v.lines(buf)) -- actual trailing value newline
+        v.keys '<CR>'
+        h.eq({ preview }, v.lines(buf))
+        v.groups()
+        h.eq({ preview, '', 'team/platform', preview, '', 'team', preview }, v.lines(buf))
+        vim.api.nvim_win_set_cursor(win, { 7, 0 })
+        v.keys '<CR>'
+        h.eq({ 'team', '' }, vim.api.nvim_buf_get_lines(buf, 7, -1, false))
+        v.keys '<CR>'
+        h.eq(preview, v.lines(buf)[#v.lines(buf)])
       end)
     end,
   },

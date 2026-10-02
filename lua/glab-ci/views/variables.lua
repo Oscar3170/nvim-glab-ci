@@ -153,6 +153,21 @@ local function header(s)
   title = shorten(title, math.max(1, vim.api.nvim_win_get_width(s.win) - 2))
   vim.wo[s.win].winbar = '%#GlabLogWinbarTitle# ' .. title:gsub('%%', '%%%%') .. ' '
 end
+local function loading_text(s)
+  local owner = s.loading_owner
+  return owner and owner.kind == 'group' and (' Loading variables for group ' .. clean(owner.path) .. '…') or ' Loading variables…'
+end
+local function update_loading(s)
+  -- During refresh, only the trailing status changes as owners advance.
+  -- Leave committed rows, their extmarks and the cursor untouched.
+  local row = s.loading_line
+  local text = loading_text(s)
+  vim.bo[s.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(s.buf, row, row + 1, false, { text })
+  vim.bo[s.buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(s.buf, ns, row, row + 1)
+  vim.api.nvim_buf_set_extmark(s.buf, ns, row, 0, { end_col = #text, hl_group = 'GlabDim' })
+end
 function M.render(s)
   if not live(s) then
     return
@@ -166,19 +181,30 @@ function M.render(s)
   local rows, marks, landing = {}, {}, nil
   local truncated_keys = {}
   for index, owner in ipairs(s.owners or {}) do
-    if (index == 1 or s.groups) and (s.completed[owner.path] or s.pending_owner == owner.path) then
-      -- The winbar already names the project. Only ancestors need a small
-      -- path label to distinguish duplicate keys owned by different groups.
+    local refresh_error = s.refresh_error and s.refresh_error.owner.path == owner.path and s.refresh_error.message or nil
+    if (index == 1 or s.groups) and (s.completed[owner.path] or s.pending_owner == owner.path or refresh_error) then
+      -- Separate sections, not the final row: expanded value newlines remain
+      -- untouched, while ordinary tables no longer end with a blank line.
+      if #lines > 0 then
+        lines[#lines + 1] = ''
+      end
+      local owner_error = refresh_error or s.owner_errors[owner.path]
+      -- Group failures belong to their source header, even when this owner
+      -- has no committed rows yet. Full errors soft-wrap rather than truncate.
       if owner.kind == 'group' then
-        lines[#lines + 1] = shorten(clean(owner.path), width)
-        marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabVarGroup' }
+        local path = owner_error and clean(owner.path) or shorten(owner.path, width)
+        lines[#lines + 1] = path .. (owner_error and (' ! ' .. clean(owner_error)) or '')
+        marks[#marks + 1] = { #lines - 1, 0, #path, 'GlabVarGroup' }
+        if owner_error then
+          marks[#marks + 1] = { #lines - 1, #path, #lines[#lines], 'GlabVarError' }
+        end
       end
       local completed = s.completed[owner.path]
       local entries = completed and (s.entries[owner.path] or {}) or {}
-      if completed and s.owner_errors[owner.path] then
+      if completed and s.owner_errors[owner.path] and owner.kind ~= 'group' then
         lines[#lines + 1] = ' ! ' .. clean(s.owner_errors[owner.path])
         marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabVarError' }
-      elseif completed and #entries == 0 then
+      elseif completed and #entries == 0 and not s.owner_errors[owner.path] then
         lines[#lines + 1] = '   (no variables)'
       end
       local cols = #entries > 0 and columns(s, entries, width) or nil
@@ -234,17 +260,16 @@ function M.render(s)
           end
         end
       end
-      if completed then
-        lines[#lines + 1] = ''
-      end
     end
   end
   if s.error then
     lines[#lines + 1] = ' ! ' .. clean(s.error)
     marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabVarError' }
   end
+  s.loading_line = nil
   if s.loading or s.resolving then
-    lines[#lines + 1] = ' Loading variables…'
+    lines[#lines + 1] = loading_text(s)
+    s.loading_line = #lines - 1
     marks[#marks + 1] = { #lines - 1, 0, #lines[#lines], 'GlabDim' }
   end
   s.rows = rows
@@ -296,6 +321,8 @@ local function fetch(s, keep_error, restart)
     return live(s) and s.generation == generation
   end
   s.loading = true
+  s.loading_owner = owners[1]
+  s.refresh_error = nil
   if not keep_error then
     s.error = nil
   end
@@ -312,6 +339,7 @@ local function fetch(s, keep_error, restart)
     local owner = owners[n]
     if not owner then
       s.loading = false
+      s.loading_owner = nil
       s.pending_owner = nil
       if not failed then
         s.entries, s.completed, s.owner_errors = entries, completed, errors
@@ -332,9 +360,12 @@ local function fetch(s, keep_error, restart)
       return
     end
     n = n + 1
+    s.loading_owner = owner
     if not atomic then
       s.pending_owner = owner.path
       M.render(s)
+    elseif n > 2 then
+      update_loading(s)
     end
     api.list(owner, function(items, err)
       if not current() then
@@ -349,7 +380,12 @@ local function fetch(s, keep_error, restart)
         local message = clean(err or 'read failed (check permissions / tier)')
         if atomic then
           s.loading = false
-          s.error = clean(owner.path) .. ': ' .. message
+          s.loading_owner = nil
+          if owner.kind == 'group' then
+            s.refresh_error = { owner = owner, message = message }
+          else
+            s.error = clean(owner.path) .. ': ' .. message
+          end
           M.render(s)
           return
         end

@@ -44,7 +44,7 @@ vim.pack.add({
 
 ### CI/CD variables
 
-`v` opens variables for the current `glab` project (not the selected pipeline). Project variables appear first; `<leader>G` toggles variables from every ancestor group, nearest first. The stable `CI Variables` winbar identifies the project; each ancestor's full path labels its group section. Duplicate keys and environment scopes remain separate records, not an effective-precedence calculation. Instance variables are not shown. On first load, a trailing indicator appears while each owner loads in order; the next group path appears after the previous owner finishes. Once loaded, `r` keeps the existing rows selectable with a small trailing loading indicator, and replaces the snapshot only after every requested owner succeeds. A failed refresh retains the old table and shows a full, sanitized, owner-specific error; `r` retries. Repeated `r` during loading is ignored. Changing group visibility cancels the pending snapshot and fetches the new owner set. Long errors soft-wrap; group-scoped variables require a compatible GitLab tier and permission.
+`v` opens variables for the current `glab` project (not the selected pipeline). Project variables appear first; `<leader>G` toggles variables from every ancestor group, nearest first.
 
 | Key | Action |
 | --- | --- |

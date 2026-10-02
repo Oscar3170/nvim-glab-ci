@@ -25,9 +25,9 @@ local function delayed_panel(run)
     run(win, buf, requests)
   end)
 end
-local function pending(buf, old)
+local function pending(buf, old, group)
   local expected = vim.list_slice(old)
-  expected[#expected + 1] = ' Loading variables…'
+  expected[#expected + 1] = group and (' Loading variables for group ' .. group .. '…') or ' Loading variables…'
   h.eq(expected, v.lines(buf))
 end
 local function marks(buf)
@@ -54,20 +54,24 @@ return {
         local currentmarks = marks(buf)
         table.remove(currentmarks) -- only the loading indicator is added
         h.eq(oldmarks, currentmarks)
-        local tick = vim.api.nvim_buf_get_changedtick(buf)
+        local changed
+        vim.api.nvim_buf_attach(buf, false, {
+          on_lines = function(_, _, _, first, last, newlast)
+            changed = { first, last, newlast }
+          end,
+        })
         requests[1].cb { item(requests[1].owner, 'new', 'ADDED'), item(requests[1].owner, 'new') }
         h.eq(2, #requests)
-        h.eq(tick, vim.api.nvim_buf_get_changedtick(buf))
-        pending(buf, old)
+        h.eq({ #old, #old + 1, #old + 1 }, changed) -- only the loading row changed
+        pending(buf, old, 'team/platform')
         v.keys '<CR>' -- pending actions still address the committed group
         v.keys '<CR>'
         h.eq('old-team/platform', v.lines(buf)[5])
-        pending(buf, old)
-        tick = vim.api.nvim_buf_get_changedtick(buf)
+        pending(buf, old, 'team/platform')
         requests[2].cb { item(requests[2].owner, 'new') }
         h.eq(3, #requests)
-        h.eq(tick, vim.api.nvim_buf_get_changedtick(buf))
-        pending(buf, old)
+        h.eq({ #old, #old + 1, #old + 1 }, changed)
+        pending(buf, old, 'team')
         requests[3].cb { item(requests[3].owner, 'new') }
         h.eq({ 5, 3 }, vim.api.nvim_win_get_cursor(win))
         h.eq('new-team/platform', v.lines(buf)[6])
@@ -84,7 +88,7 @@ return {
         local failure = 'Denied\nwith\27 details ' .. string.rep('detail-', 45)
         requests[5].cb(nil, failure)
         local expected = vim.list_slice(old)
-        expected[#expected + 1] = ' ! team/platform: ' .. failure:gsub('[%c\27]', ' ')
+        expected[vim.fn.index(expected, 'team/platform') + 1] = 'team/platform ! ' .. failure:gsub('[%c\27]', ' ')
         h.eq(expected, v.lines(buf))
         h.eq(5, #requests) -- abort; final group is not requested
         h.eq({ 5, 3 }, vim.api.nvim_win_get_cursor(win))
@@ -124,12 +128,12 @@ return {
         requests[1].cb { item(requests[1].owner, 'canceled') }
         v.groups() -- restart with project only; hide already committed groups
         h.eq(3, #requests)
-        h.eq({ old[1], '', ' Loading variables…' }, v.lines(buf))
+        h.eq({ old[1], ' Loading variables…' }, v.lines(buf))
         requests[2].cb { item(requests[2].owner, 'late-group') }
         h.eq(3, #requests)
-        h.eq({ old[1], '', ' Loading variables…' }, v.lines(buf))
+        h.eq({ old[1], ' Loading variables…' }, v.lines(buf))
         requests[3].cb { item(requests[3].owner, 'current') }
-        h.eq({ old[1], '' }, v.lines(buf)) -- previews still hidden
+        h.eq({ old[1] }, v.lines(buf)) -- previews still hidden; no trailing blank
         v.keys '<CR>'
         h.eq('current-team/platform/app', v.lines(buf)[2])
         v.keys '<CR>'
@@ -160,6 +164,54 @@ return {
     end,
   },
   {
+    name = 'a first group refresh failure gets a source header without discarding committed project rows',
+    run = function()
+      local path = 'tëam/' .. string.rep('nested/', 20) .. 'group'
+      local namespace = { full_path = path }
+      local source = vim.tbl_extend('force', project, { namespace = namespace })
+      local requests, delayed = {}, false
+      v.with_panel(source, function(owner, cb)
+        if delayed then
+          requests[#requests + 1] = { owner = owner, cb = cb }
+        else
+          cb { item(owner, 'committed') }
+        end
+      end, function(win, buf, resize)
+        resize(80)
+        local old = v.lines(buf)
+        h.eq(1, #old) -- project-only view has no trailing separator
+        delayed = true
+        v.groups()
+        requests[1].cb { item(requests[1].owner, 'staged') }
+        pending(buf, old, path)
+        local failure = 'Denied\nwith\27 details ' .. string.rep('detail-', 30)
+        requests[2].cb(nil, failure)
+        local error_header = path .. ' ! ' .. failure:gsub('[%c\27]', ' ')
+        h.eq({ old[1], '', error_header }, v.lines(buf))
+        h.eq(1, vim.api.nvim_win_get_cursor(win)[1])
+        h.eq(true, vim.wo[win].wrap)
+        local ns = vim.api.nvim_get_namespaces().glab_ci_variables
+        local highlights = {}
+        for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, { 2, 0 }, { 2, -1 }, { details = true })) do
+          highlights[mark[4].hl_group] = { mark[3], mark[4].end_col }
+        end
+        h.eq({ GlabVarGroup = { 0, #path }, GlabVarError = { #path, #error_header } }, highlights)
+        v.keys '<CR>' -- the retained project row is still actionable
+        h.eq('committed-team/platform/app', v.lines(buf)[2])
+        v.keys '<CR>'
+        v.keys 'r'
+        pending(buf, old) -- retry removes the transient failed group header
+        requests[3].cb { item(requests[3].owner, 'retry') }
+        pending(buf, old, path)
+        v.groups() -- cancel all groups while their retry is pending
+        requests[4].cb(nil, 'late error')
+        requests[5].cb { item(requests[5].owner, 'retry') }
+        h.eq(1, #v.lines(buf))
+        h.eq(false, table.concat(v.lines(buf)):find('late error', 1, true) ~= nil)
+      end)
+    end,
+  },
+  {
     name = 'mutation-triggered refresh retains the snapshot through delayed owners and a failed refresh',
     run = function()
       local saved = { get = api.get, delete = api.delete, input = vim.ui.input }
@@ -186,16 +238,16 @@ return {
           requests[1].cb { item(requests[1].owner, 'stale-pre-write') }
           pending(buf, old)
           requests[2].cb {}
-          pending(buf, old)
+          pending(buf, old, 'team/platform')
           requests[3].cb(nil, 'Group denied after deletion')
           local expected = vim.list_slice(old)
-          expected[#expected + 1] = ' ! team/platform: Group denied after deletion'
+          expected[vim.fn.index(expected, 'team/platform') + 1] = 'team/platform ! Group denied after deletion'
           h.eq(expected, v.lines(buf))
           v.keys 'r'
           for i = 4, 6 do
             requests[i].cb {}
           end
-          h.eq({ '   (no variables)', '', 'team/platform', '   (no variables)', '', 'team', '   (no variables)', '' }, v.lines(buf))
+          h.eq({ '   (no variables)', '', 'team/platform', '   (no variables)', '', 'team', '   (no variables)' }, v.lines(buf))
         end)
       end, debug.traceback)
       api.get, api.delete, vim.ui.input = saved.get, saved.delete, saved.input

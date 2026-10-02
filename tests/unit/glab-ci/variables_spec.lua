@@ -246,7 +246,7 @@ return {
           requests[2].cb { vim.deepcopy(record) }
           h.eq('team/platform', requests[3].owner.path)
           h.truthy(lines()[1]:match '^S')
-          h.eq(' Loading variables…', lines()[#lines()])
+          h.eq(' Loading variables for group team/platform…', lines()[#lines()])
           h.truthy(vim.tbl_contains(lines(), 'team/platform')) -- project finished; this group is now loading
           h.eq(false, vim.tbl_contains(lines(), 'team'))
           h.eq(false, vim.tbl_contains(lines(), '   (no variables)'))
@@ -255,26 +255,25 @@ return {
           h.eq('team', requests[4].owner.path)
           local result = lines()
           h.eq(false, result[1]:find('!', 1, true) ~= nil)
-          h.truthy(vim.tbl_contains(result, 'team/platform'))
-          h.truthy(vim.tbl_contains(result, ' ! ' .. failure))
+          h.truthy(vim.tbl_contains(result, 'team/platform ! ' .. failure))
           h.truthy(vim.tbl_contains(result, 'team')) -- only shown after the preceding group failed
-          h.truthy(vim.fn.index(result, ' ! ' .. failure) < vim.fn.index(result, 'team'))
+          h.truthy(vim.fn.index(result, 'team/platform ! ' .. failure) < vim.fn.index(result, 'team'))
           h.eq(false, vim.tbl_contains(result, '   (no variables)'))
-          h.eq(' Loading variables…', result[#result])
+          h.eq(' Loading variables for group team…', result[#result])
           h.eq(true, vim.wo[win].wrap)
           h.truthy(vim.fn.strdisplaywidth(' ! ' .. failure) > vim.api.nvim_win_get_width(win))
           requests[4].cb(nil, 'Not permitted')
           result = lines()
           h.eq(false, vim.tbl_contains(result, ' Loading variables…'))
-          h.truthy(vim.tbl_contains(result, 'team'))
-          h.truthy(vim.tbl_contains(result, ' ! Not permitted'))
+          h.truthy(vim.tbl_contains(result, 'team ! Not permitted'))
+          h.truthy(result[#result] ~= '')
           h.eq(false, vim.wo[win].winbar:find('error', 1, true) ~= nil)
           vim.cmd 'normal r'
           h.eq({ ' Loading variables…' }, lines())
           requests[5].cb {}
           h.truthy(vim.tbl_contains(lines(), '   (no variables)'))
-          h.eq(false, vim.tbl_contains(lines(), ' ! ' .. failure)) -- stale group error is hidden during refresh
-          h.eq(' Loading variables…', lines()[#lines()])
+          h.eq(false, vim.tbl_contains(lines(), 'team/platform ! ' .. failure)) -- stale group error is hidden during refresh
+          h.eq(' Loading variables for group team/platform…', lines()[#lines()])
           -- Hiding groups invalidates the outstanding group request.
           vim.api.nvim_feedkeys((vim.g.mapleader or '\\') .. 'G', 'xt', false)
           requests[6].cb {}
